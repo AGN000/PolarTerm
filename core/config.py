@@ -3,7 +3,12 @@ import os
 from dataclasses import dataclass, asdict
 from typing import List, Optional
 
-CONFIG_DIR = os.path.expanduser("~/.config/polarterm")
+import platform as _plat
+if _plat.system() == "Windows":
+    _base = os.environ.get("APPDATA", os.path.expanduser("~"))
+    CONFIG_DIR = os.path.join(_base, "polarterm")
+else:
+    CONFIG_DIR = os.path.expanduser("~/.config/polarterm")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "sessions.json")
 
 # encryption helper - lazy import to avoid hard dep if cryptography missing

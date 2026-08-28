@@ -3,7 +3,12 @@ import base64
 import hashlib
 from pathlib import Path
 
-CONFIG_DIR = os.path.expanduser("~/.config/polarterm")
+import platform as _plat
+if _plat.system() == "Windows":
+    _base = os.environ.get("APPDATA", os.path.expanduser("~"))
+    CONFIG_DIR = os.path.join(_base, "polarterm")
+else:
+    CONFIG_DIR = os.path.expanduser("~/.config/polarterm")
 KEY_FILE = os.path.join(CONFIG_DIR, ".key")
 
 def _get_key() -> bytes:

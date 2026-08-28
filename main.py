@@ -3,15 +3,20 @@ import sys
 import os
 import traceback
 import logging
-# --- stability env before Qt import ---
-# Force XCB on X11 (fixes Wayland/anaconda Qt mismatch), disable problematic IM
-os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
-os.environ["QT_IM_MODULE"] = os.environ.get("QT_IM_MODULE", "")
+# --- stability env before Qt import (Linux only) ---
+import platform as _plat
+if _plat.system() == "Linux":
+    # Force XCB on X11 (fixes Wayland/anaconda Qt mismatch), disable problematic IM
+    os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+    os.environ["QT_IM_MODULE"] = os.environ.get("QT_IM_MODULE", "")
 # Ensure project root in path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# logging to file for diagnosis of "unstable"
-LOG_FILE = "/tmp/polarterm.log"
+# logging to file for diagnosis of "unstable" — cross-platform
+if _plat.system() == "Windows":
+    LOG_FILE = os.path.join(os.environ.get("TEMP", os.path.expanduser("~")), "polarterm.log")
+else:
+    LOG_FILE = "/tmp/polarterm.log"
 logging.basicConfig(
     filename=LOG_FILE,
     level=logging.INFO,

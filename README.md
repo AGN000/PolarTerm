@@ -1,8 +1,8 @@
-# PolarTerm — PolarTerm for Linux
+# PolarTerm — HPC Terminal & File Manager (Linux + Windows)
 
-A Linux-native alternative to PolarTerm: **Tabbed SSH terminal + SFTP file transfer GUI + HPC friendly**.
+A MobaXterm alternative for **Linux + Windows**: **Tabbed SSH terminal + SFTP file transfer GUI + HPC friendly** with penguin easter eggs.
 
-Built with **Python + PyQt6 + Paramiko**. Works on Ubuntu 22.04/24.04, Fedora, Arch.
+Built with **Python + PyQt6 + Paramiko**. Works on Ubuntu 22.04/24.04, Fedora, Arch **and Windows 10/11**.
 
 ## Features
 
@@ -12,10 +12,10 @@ Built with **Python + PyQt6 + Paramiko**. Works on Ubuntu 22.04/24.04, Fedora, A
 - **HPC Ready** — jump host support, quick bar for `squeue`, `qstat`, `sinfo`, `module avail`, etc.
 - **Local Terminal** — open bash tabs alongside remote sessions.
 
-## Install
+## Install (Linux)
 
 ```bash
-git clone <this-repo>
+git clone https://github.com/AGN000/PolarTerm.git
 cd PolarTerm
 pip install -r requirements.txt
 # or: pip install PyQt6 paramiko
@@ -32,6 +32,42 @@ chmod +x main.py
 ```
 
 Then find "PolarTerm" in app grid.
+
+## Install (Windows) — Exe
+
+**Option 1: Download exe (easy)**
+1. Go to **Releases** → https://github.com/AGN000/PolarTerm/releases
+2. Download `PolarTerm.exe` (or `PolarTerm-Setup-1.0.exe` installer)
+3. Double-click to run — no Python needed.
+
+**Option 2: Build exe yourself on Windows**
+
+```bat
+REM In Windows CMD or PowerShell, in PolarTerm folder:
+pip install -r requirements.txt
+pip install pyinstaller pillow
+
+REM Quick build (onefile):
+pyinstaller --noconfirm --clean --windowed --onefile --icon=resources/polarterm.ico --name=PolarTerm --add-data "resources/polarterm.png;resources" --add-data "resources/polarterm.ico;resources" main.py
+REM Result: dist\PolarTerm.exe
+
+REM Or use spec:
+pyinstaller PolarTerm.spec
+
+REM Or just double-click:
+build_windows.bat
+REM PowerShell:
+.\build_windows.ps1
+```
+
+For installer (Start Menu + Desktop shortcut):
+```bat
+REM Install Inno Setup from https://jrsoftware.org/isinfo.php
+iscc installer.iss
+REM Result: installer\PolarTerm-Setup-1.0.exe
+```
+
+Config on Windows: `%APPDATA%\polarterm\sessions.json` (or `%TEMP%\polarterm.log`), portable.
 
 ## Usage
 

@@ -5,7 +5,11 @@ import subprocess
 import tempfile
 from PyQt6.QtCore import QObject, QTimer, QFileSystemWatcher, pyqtSignal
 
-CACHE_DIR = os.path.expanduser("~/.cache/polarterm/edit")
+import platform as _plat
+if _plat.system() == "Windows":
+    CACHE_DIR = os.path.join(os.environ.get("TEMP", os.path.expanduser("~")), "polarterm", "edit")
+else:
+    CACHE_DIR = os.path.expanduser("~/.cache/polarterm/edit")
 
 def _sanitize_remote(remote_path: str) -> str:
     return remote_path.replace("/", "_").replace("\\", "_").replace(":", "_")
