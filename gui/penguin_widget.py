@@ -97,7 +97,15 @@ class IdleMonitor(QTimer):
                 self.penguin.start()
 
 class FallingPenguinsOverlay(QWidget):
-    """Full-window overlay with falling penguins like MobaXterm easter egg. Click button to trigger."""
+    """Full-window overlay with falling particles like MobaXterm easter egg. Supports penguin/rose/ice/feather on same icon."""
+    # mode -> (primary emojis, secondary emojis, colors)
+    THEMES = {
+        "penguin": (["🐧"], ["❄"], ["#0ea5e9"]),
+        "rose": (["🌹","🌸","🌷","🥀","🌺"], ["❀"," petals"], ["#f43f5e","#ec4899","#be123c"]),
+        "ice": (["🧊","❄","❅","❆","💎"], ["·"], ["#7dd3fc","#0ea5e9","#e0f2fe"]),
+        "feather": (["🪶","🕊️","☁️"], ["·"], ["#f8fafc","#e2e8f0","#cbd5e1"]),
+        "mixed": (["🐧","🌹","🧊","🪶","❄"], ["·"], ["#0ea5e9","#f43f5e","#7dd3fc"]),
+    }
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
@@ -108,12 +116,20 @@ class FallingPenguinsOverlay(QWidget):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
         self.setMouseTracking(True)
+        self.current_mode = "penguin"
 
     def mousePressEvent(self, event):
         # click anywhere to stop
         self.stop()
 
-    def start(self, count=18):
+    def start(self, count=18, mode=None):
+        if mode:
+            self.current_mode = mode
+        else:
+            # cycle if not specified? keep current
+            pass
+        # theme
+        primaries, secondaries, colors = self.THEMES.get(self.current_mode, self.THEMES["penguin"])
         if self.parent():
             self.setGeometry(self.parent().rect())
             self.raise_()
@@ -123,25 +139,31 @@ class FallingPenguinsOverlay(QWidget):
             lbl.deleteLater()
         self.penguins.clear()
         w = self.width() or 1200
-        # create penguins
+        # create primaries
         for i in range(count):
-            lbl = QLabel("🐧", self)
-            # random size
-            sz = random.randint(22, 34)
+            emoji = random.choice(primaries)
+            lbl = QLabel(emoji, self)
+            sz = random.randint(22, 34) if self.current_mode=="penguin" else random.randint(18, 30)
+            # color via stylesheet if needed (emoji color is fixed, but we can add glow)
             lbl.setStyleSheet(f"font-size: {sz}px; background: transparent;")
             lbl.adjustSize()
             x = random.randint(0, max(0, w-60))
             y = random.randint(-300, -30)
-            speed = random.uniform(2.5, 6.5)
+            speed = random.uniform(2.5, 6.5) if self.current_mode=="penguin" else random.uniform(1.8, 5.0)
             drift = random.uniform(-1.2, 1.2)
             lbl.move(int(x), int(y))
             lbl.show()
             self.penguins.append([lbl, float(x), float(y), speed, drift, 0])
-        # snowflakes too
-        for i in range(12):
-            lbl = QLabel("❄", self)
+        # secondaries
+        sec_count = 12 if self.current_mode=="penguin" else 10
+        for i in range(sec_count):
+            emoji = random.choice(secondaries) if secondaries[0]!="·" else "·"
+            if emoji == "·":
+                emoji = random.choice(["·","•","❄"]) if self.current_mode in ("ice","feather") else "❄"
+            lbl = QLabel(emoji, self)
             sz = random.randint(14, 20)
-            lbl.setStyleSheet(f"font-size: {sz}px; color: #7dd3fc; background: transparent;")
+            col = random.choice(colors) if colors else "#7dd3fc"
+            lbl.setStyleSheet(f"font-size: {sz}px; color: {col}; background: transparent;")
             lbl.adjustSize()
             x = random.randint(0, max(0, w-40))
             y = random.randint(-400, -20)
@@ -183,3 +205,74 @@ class FallingPenguinsOverlay(QWidget):
             item[1], item[2] = x, y
             alive.append(item)
         self.penguins = alive
+
+class RadioPulseWidget(QWidget):
+    """Nice radio pulse animation when icon clicked — expanding circles like a radio button."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.hide()
+        self._radius = 0
+        self._opacity = 1.0
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._animate)
+        self.center = QPoint(0,0)
+        self.max_radius = 60
+        self.step = 0
+
+    def pulse_at(self, global_pos, parent_widget):
+        # map global to parent
+        if parent_widget:
+            self.setParent(parent_widget)
+            self.setGeometry(parent_widget.rect())
+            self.raise_()
+            local = parent_widget.mapFromGlobal(global_pos)
+            self.center = local
+        else:
+            self.center = QPoint(self.width()//2, self.height()//2)
+        self._radius = 10
+        self._opacity = 0.9
+        self.step = 0
+        self.show()
+        self.timer.start(16)
+
+    def _animate(self):
+        self.step += 1
+        self._radius += 3.5
+        self._opacity -= 0.04
+        if self._radius > self.max_radius or self._opacity <= 0:
+            self.timer.stop()
+            self.hide()
+            self._radius = 0
+            self._opacity = 1.0
+            self.update()
+            return
+        self.update()
+
+    def paintEvent(self, event):
+        from PyQt6.QtGui import QPainter, QPen, QColor, QBrush
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # outer ripple
+        col = QColor("#0ea5e9")
+        col.setAlphaF(max(0, self._opacity*0.35))
+        p.setPen(QPen(col, 2))
+        p.setBrush(QBrush(QColor(0,0,0,0)))
+        p.drawEllipse(self.center, int(self._radius), int(self._radius))
+        # inner solid dot
+        col2 = QColor("#0284c7")
+        col2.setAlphaF(max(0, self._opacity))
+        p.setBrush(QBrush(col2))
+        p.setPen(Qt.PenStyle.NoPen)
+        inner_r = max(4, int(10 - self.step*0.15))
+        p.drawEllipse(self.center, inner_r, inner_r)
+        # second ripple
+        if self.step > 6:
+            r2 = self._radius - 12
+            if r2 > 10:
+                col3 = QColor("#7dd3fc")
+                col3.setAlphaF(max(0, (self._opacity*0.25)))
+                p.setPen(QPen(col3, 1.5))
+                p.setBrush(QBrush(QColor(0,0,0,0)))
+                p.drawEllipse(self.center, int(r2), int(r2))

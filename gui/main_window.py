@@ -1,7 +1,7 @@
 import os, sys, time, shlex
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QListWidget, QListWidgetItem,
                              QPushButton, QLabel, QTabWidget, QToolBar, QMessageBox, QInputDialog, QMenu, QFrame,
-                             QTextEdit, QLineEdit, QComboBox, QGroupBox, QFormLayout)
+                             QTextEdit, QLineEdit, QComboBox, QGroupBox, QFormLayout, QToolButton)
 from PyQt6.QtCore import Qt, QSize, QTimer, QThread, pyqtSignal
 from PyQt6.QtGui import QAction, QIcon, QFont
 
@@ -10,7 +10,7 @@ from core.ssh_client import SSHClientWrapper
 from gui.session_dialog import SessionDialog
 from gui.terminal_widget import TerminalWidget
 from gui.file_transfer_widget import FileTransferWidget
-from gui.penguin_widget import PenguinIdleWidget, IdleMonitor, FallingPenguinsOverlay
+from gui.penguin_widget import PenguinIdleWidget, IdleMonitor, FallingPenguinsOverlay, RadioPulseWidget
 from gui.job_indicator import JobIndicatorWidget
 
 def _icon_path():
@@ -228,9 +228,13 @@ class MainWindow(QMainWindow):
         self.penguin_widget = PenguinIdleWidget()
         main_layout.addWidget(self.penguin_widget)
 
-        # falling penguins overlay (hidden until button)
+        # falling overlay (supports penguin/rose/ice/feather on same icon)
         self.penguin_fall = FallingPenguinsOverlay(central)
         self.penguin_fall.hide()
+        # radio pulse for icon click
+        self.radio_pulse = RadioPulseWidget(central)
+        self.radio_pulse.hide()
+        self._fall_mode = "penguin"  # cycle state
 
         # menubar
         menubar = self.menuBar()
@@ -266,10 +270,30 @@ class MainWindow(QMainWindow):
         act_disc.triggered.connect(self.disconnect_all)
         tb.addAction(act_disc)
         tb.addSeparator()
-        act_penguin = QAction(QIcon(_icon_path()) if _icon_path() else QIcon(), "🐧 Snow!", self)
-        act_penguin.setToolTip("Make penguins fall! (like MobaXterm) — click overlay to stop")
-        act_penguin.triggered.connect(self.trigger_penguin_fall)
-        tb.addAction(act_penguin)
+        # Same icon with multiple fall animations (penguin/rose/ice/feather) + radio pulse
+        self.btn_snow_tool = QToolButton(self)
+        self.btn_snow_tool.setIcon(QIcon(_icon_path()) if _icon_path() else QIcon.fromTheme("weather-snow"))
+        self.btn_snow_tool.setText("❄ Fall")
+        self.btn_snow_tool.setToolTip("Same icon — click for penguin snow, dropdown for rose/ice/feather/mixture. Shows radio pulse on click.")
+        self.btn_snow_tool.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.btn_snow_tool.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        # menu for same icon with different animations
+        snow_menu = QMenu(self.btn_snow_tool)
+        for label, mode, tip in [
+            ("🐧 Penguin Snow", "penguin", "Classic penguins + snow"),
+            ("🌹 Rose Petals", "rose", "Falling rose petals"),
+            ("🧊 Ice Crystals", "ice", "Ice crystals & snow"),
+            ("🪶 Feather Fall", "feather", "Light feathers drifting"),
+            ("🎭 Mixed", "mixed", "Penguins + roses + ice + feathers"),
+        ]:
+            act = QAction(label, self)
+            act.setToolTip(tip)
+            act.triggered.connect(lambda checked, m=mode, l=label: self.trigger_fall_mode(m, l))
+            snow_menu.addAction(act)
+        self.btn_snow_tool.setMenu(snow_menu)
+        # click on icon itself (not dropdown) → penguin + radio pulse (and cycle)
+        self.btn_snow_tool.clicked.connect(lambda: self.trigger_fall_with_radio("penguin"))
+        tb.addWidget(self.btn_snow_tool)
 
     def _create_welcome(self):
         w = QWidget()
@@ -291,16 +315,27 @@ class MainWindow(QMainWindow):
         col.addWidget(sub)
         banner.addLayout(col)
         banner.addStretch()
-        # idle demo button + falling button
+        # idle demo button + falling button (same icon, multiple animations)
         btn_box = QVBoxLayout()
         btn_peng = QPushButton("🐧 Wake Penguin")
         btn_peng.setStyleSheet("background:#e0f2fe; border:1px solid #7dd3fc; padding:8px 12px; border-radius:8px;")
         btn_peng.clicked.connect(lambda: self.penguin_widget.start() if not self.penguin_widget.isVisible() else self.penguin_widget.stop())
         btn_box.addWidget(btn_peng)
-        self.btn_fall_welcome = QPushButton("❄ 🐧 Let it Snow!")
-        self.btn_fall_welcome.setToolTip("Make penguins fall across window (click overlay to stop)")
+        # Same PolarTerm icon with rose/ice/feather/penguin cycle + radio pulse
+        self.btn_fall_welcome = QToolButton()
+        self.btn_fall_welcome.setIcon(QIcon(_icon_path()) if _icon_path() else QIcon())
+        self.btn_fall_welcome.setText("❄ Let it Snow!")
+        self.btn_fall_welcome.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.btn_fall_welcome.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        self.btn_fall_welcome.setToolTip("Same icon — click for penguin snow, dropdown for rose/ice/feather. Click shows radio pulse.")
         self.btn_fall_welcome.setStyleSheet("background:#0284c7; color:white; font-weight:bold; padding:8px 12px; border-radius:8px;")
-        self.btn_fall_welcome.clicked.connect(self.trigger_penguin_fall)
+        fall_menu = QMenu(self.btn_fall_welcome)
+        for label, mode in [("🐧 Penguin Snow","penguin"),("🌹 Rose Petals","rose"),("🧊 Ice Crystals","ice"),("🪶 Feather Fall","feather"),("🎭 Mixed","mixed")]:
+            act = QAction(label, self)
+            act.triggered.connect(lambda checked, m=mode, l=label: self.trigger_fall_mode(m, l))
+            fall_menu.addAction(act)
+        self.btn_fall_welcome.setMenu(fall_menu)
+        self.btn_fall_welcome.clicked.connect(lambda: self.trigger_fall_with_radio("penguin"))
         btn_box.addWidget(self.btn_fall_welcome)
         banner.addLayout(btn_box)
         l.addLayout(banner)
@@ -329,11 +364,12 @@ class MainWindow(QMainWindow):
 4. For HPC: set Remote Path to /scratch/$USER, use HPC Quick Bar
 
 New in PolarTerm:
- • Encrypted passwords (Fernet, 0600)
- • Drag & drop between panes & OS file manager
- • Right-click file → Edit Locally (auto-upload)
- • Penguin idle animation (18s idle)
- • Nice PolarTerm icon (no conflict with MobaXterm)""")
+  • Encrypted passwords (Fernet, 0600)
+  • Drag & drop + Cut/Copy/Paste (Ctrl+C/X/V, Del) duplicate
+  • Right-click → Edit Locally (auto-upload), Bookmark, New Folder (host)
+  • Penguin idle (18s) + ❄ Fall (same icon): 🐧/🌹/🧊/🪶/🎭 + radio pulse on click
+  • Job indicator (squeue/qstat) + Bookmarks window
+  • Nice PolarTerm icon (no MobaXterm conflict)""")
         l.addWidget(hint)
 
         footer = QLabel("PolarTerm v1.0 • Built with PyQt6 + Paramiko • Shows 🐧 when idle • Icon: polarterm.png")
@@ -727,14 +763,39 @@ New in PolarTerm:
             "Icon by PolarTerm (Tux-style)")
 
     def trigger_penguin_fall(self):
+        # backward compat: same icon penguin
+        self.trigger_fall_with_radio("penguin")
+
+    def trigger_fall_mode(self, mode, label=""):
         self.idle_monitor.touch()
-        if self.penguin_fall.isVisible():
+        # if same mode and visible, toggle off
+        if self.penguin_fall.isVisible() and self.penguin_fall.current_mode == mode:
             self.penguin_fall.stop()
-            self.left_status.setText("Penguin snow stopped ❄")
-        else:
-            self.penguin_fall.start(count=22)
-            self.left_status.setText("❄ 🐧 Let it snow! Click overlay to stop ❄")
-            QTimer.singleShot(12000, self.penguin_fall.stop)  # auto stop after 12s
+            self.left_status.setText(f"{label} stopped")
+            return
+        # start with mode on same icon
+        count = 22 if mode=="penguin" else 26
+        self.penguin_fall.start(count=count, mode=mode)
+        self.left_status.setText(f"{label or mode} falling — click overlay to stop ❄ (same PolarTerm icon)")
+        QTimer.singleShot(12000, self.penguin_fall.stop)
+
+    def trigger_fall_with_radio(self, mode="penguin"):
+        self.idle_monitor.touch()
+        # nice radio pulse animation on same icon
+        try:
+            # pulse at toolbar snow button
+            if hasattr(self, 'btn_snow_tool'):
+                pos = self.btn_snow_tool.mapToGlobal(self.btn_snow_tool.rect().center())
+                self.radio_pulse.pulse_at(pos, self.centralWidget())
+            # also pulse at welcome button if visible
+            if hasattr(self, 'btn_fall_welcome') and self.btn_fall_welcome.isVisible():
+                pos2 = self.btn_fall_welcome.mapToGlobal(self.btn_fall_welcome.rect().center())
+                # second pulse slightly delayed
+                QTimer.singleShot(180, lambda: self.radio_pulse.pulse_at(pos2, self.centralWidget()))
+        except: pass
+        # cycle mode if clicked same icon repeatedly without menu? keep penguin default
+        label_map = {"penguin":"🐧 Penguin Snow","rose":"🌹 Rose Petals","ice":"🧊 Ice Crystals","feather":"🪶 Feather Fall","mixed":"🎭 Mixed"}
+        self.trigger_fall_mode(mode, label_map.get(mode, mode))
 
     def closeEvent(self, event):
         for t in self.terminal_tabs.values():
