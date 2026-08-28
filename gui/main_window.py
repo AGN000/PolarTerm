@@ -129,6 +129,8 @@ class MainWindow(QMainWindow):
             QListWidget::item:selected { background:#e0f2fe; color:#0c4a6e; }
         """)
         self.session_list.doubleClicked.connect(self.connect_selected)
+        self.session_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.session_list.customContextMenuRequested.connect(self.on_session_context_menu)
         lyt.addWidget(self.session_list, 1)
 
         conn_layout = QVBoxLayout()
@@ -177,24 +179,33 @@ class MainWindow(QMainWindow):
             QListWidget::item { padding:6px; border-bottom:1px solid #f1f5f9; }
             QListWidget::item:selected { background:#fffbeb; color:#92400e; }
         """)
-        self.bookmark_list.setMaximumHeight(110)
+        self.bookmark_list.setMinimumHeight(90)
+        self.bookmark_list.setMaximumHeight(160)
         self.bookmark_list.doubleClicked.connect(self.jump_bookmark)
         bm_lyt.addWidget(self.bookmark_list)
         bm_btn_row = QHBoxLayout()
-        self.btn_bm_add = QPushButton("＋ Add Current")
+        self.btn_bm_add = QPushButton("＋ Add")
         self.btn_bm_add.setToolTip("Bookmark current remote folder (from active Files tab)")
         self.btn_bm_add.setStyleSheet("background:#fffbeb; border:1px solid #fcd34d; padding:4px; border-radius:6px; font-size:11px;")
         self.btn_bm_add.clicked.connect(self.add_bookmark_current)
         self.btn_bm_del = QPushButton("✕")
         self.btn_bm_del.setFixedWidth(28)
+        self.btn_bm_del.setToolTip("Delete selected bookmark")
         self.btn_bm_del.clicked.connect(self.del_bookmark)
         self.btn_bm_jump = QPushButton("→ Jump")
+        self.btn_bm_jump.setToolTip("Jump to selected bookmark folder (works after login)")
         self.btn_bm_jump.setStyleSheet("background:#0284c7; color:white; padding:4px 8px; border-radius:6px; font-size:11px;")
         self.btn_bm_jump.clicked.connect(self.jump_bookmark)
         bm_btn_row.addWidget(self.btn_bm_add)
         bm_btn_row.addWidget(self.btn_bm_del)
         bm_btn_row.addWidget(self.btn_bm_jump)
         bm_lyt.addLayout(bm_btn_row)
+        # manager button - small window as requested
+        self.btn_bm_manage = QPushButton("📖 Manager — Small Window")
+        self.btn_bm_manage.setToolTip("Open dedicated bookmark manager window (add/edit/jump with auto-jump on login)")
+        self.btn_bm_manage.setStyleSheet("background:white; border:1px solid #cbd5e1; padding:4px; border-radius:6px; font-size:11px;")
+        self.btn_bm_manage.clicked.connect(self.open_bookmark_manager)
+        bm_lyt.addWidget(self.btn_bm_manage)
         # small hint
         bm_hint = QLabel("Double-click to jump. Bookmarks persist and auto-jump option on connect.")
         bm_hint.setWordWrap(True)
@@ -256,6 +267,14 @@ class MainWindow(QMainWindow):
         act_about = QAction("About PolarTerm", self)
         act_about.triggered.connect(self.show_about)
         m_help.addAction(act_about)
+        m_bm = menubar.addMenu("Bookmarks")
+        act_bm_manager = QAction("📖 Bookmark Manager (Small Window)", self)
+        act_bm_manager.setShortcut("Ctrl+B")
+        act_bm_manager.triggered.connect(self.open_bookmark_manager)
+        m_bm.addAction(act_bm_manager)
+        act_bm_add = QAction("＋ Add Current Folder", self)
+        act_bm_add.triggered.connect(self.add_bookmark_current)
+        m_bm.addAction(act_bm_add)
 
         tb = QToolBar("Main")
         tb.setIconSize(QSize(16,16))
@@ -401,6 +420,140 @@ New in PolarTerm:
                 return s
         return None
 
+    def on_session_context_menu(self, pos):
+        item = self.session_list.itemAt(pos)
+        if not item:
+            return
+        name = item.data(Qt.ItemDataRole.UserRole)
+        s = None
+        for sess in load_sessions():
+            if sess.name == name:
+                s = sess
+                break
+        if not s:
+            return
+        menu = QMenu(self)
+        is_connected = name in self.ssh_sessions and self.ssh_sessions[name].connected
+        # Check if tabs exist
+        has_term = any(name in k for k in self.terminal_tabs.keys()) or name in self.terminal_tabs
+        has_files = name in self.transfer_tabs
+        act_connect = menu.addAction("▶ Connect" if not is_connected else "✓ Connected (focus)")
+        act_open_term = menu.addAction("🖥 Open Terminal" + (" (new)" if has_term else ""))
+        act_open_files = menu.addAction("📁 Open File Manager" + (" (new)" if has_files else ""))
+        act_reopen_both = menu.addAction("🔄 Reopen Terminal + Files")
+        menu.addSeparator()
+        act_disconnect = menu.addAction("⏏ Disconnect")
+        act_disconnect.setEnabled(is_connected)
+        act = menu.exec(self.session_list.viewport().mapToGlobal(pos))
+        if not act:
+            return
+        if act == act_connect:
+            self.session_list.setCurrentItem(item)
+            self.connect_selected()
+        elif act == act_open_term:
+            self.session_list.setCurrentItem(item)
+            if is_connected:
+                self.open_terminal_for_session(name)
+            else:
+                self.connect_selected()
+        elif act == act_open_files:
+            self.session_list.setCurrentItem(item)
+            if is_connected:
+                self.open_files_for_session(name)
+            else:
+                self.connect_selected()
+        elif act == act_reopen_both:
+            self.session_list.setCurrentItem(item)
+            if is_connected:
+                self.open_terminal_for_session(name)
+                self.open_files_for_session(name)
+            else:
+                self.connect_selected()
+        elif act == act_disconnect:
+            if name in self.ssh_sessions:
+                try: self.ssh_sessions[name].close()
+                except: pass
+                del self.ssh_sessions[name]
+                # close related tabs
+                for idx in reversed(range(self.tabs.count())):
+                    w = self.tabs.widget(idx)
+                    txt = self.tabs.tabText(idx)
+                    if name in txt:
+                        try:
+                            if isinstance(w, TerminalWidget):
+                                w.close_shell()
+                        except: pass
+                        self.tabs.removeTab(idx)
+                self.job_indicator.clear()
+                self.left_status.setText(f"Disconnected {name}")
+
+    def open_terminal_for_session(self, session_name):
+        self.idle_monitor.touch()
+        if session_name not in self.ssh_sessions or not self.ssh_sessions[session_name].connected:
+            QMessageBox.information(self, "Not connected", f"{session_name} not connected. Click Connect first.")
+            return
+        wrapper = self.ssh_sessions[session_name]
+        # check if terminal already open - focus it
+        for i in range(self.tabs.count()):
+            if self.tabs.tabText(i).startswith(f"🖥 {session_name}"):
+                self.tabs.setCurrentIndex(i)
+                return
+        # create new terminal
+        term = TerminalWidget(ssh_wrapper=wrapper)
+        # use same logic as open_remote_terminal_at but for root
+        try:
+            channel = wrapper.client.invoke_shell(term="xterm-256color", width=120, height=30)
+            channel.settimeout(0.0)
+            term.ssh = wrapper
+            term.channel = channel
+            from gui.terminal_widget import ShellReaderThread
+            term.reader = ShellReaderThread(channel)
+            term.reader.data_received.connect(term.on_data)
+            term.reader.disconnected.connect(term.on_disconnect)
+            term.reader.start()
+            term.status_label.setText(f"Connected to {wrapper.host} | Shell for {session_name}")
+            term.status_label.setStyleSheet("color: #0ea5e9; font-size: 11px;")
+        except Exception as e:
+            QMessageBox.warning(self, "Terminal error", str(e))
+            return
+        idx = self.tabs.addTab(term, f"🖥 {session_name}")
+        self.tabs.setCurrentIndex(idx)
+        key = f"{session_name}-term-{idx}-{int(time.time())}"
+        self.terminal_tabs[key]=term
+
+    def open_files_for_session(self, session_name):
+        self.idle_monitor.touch()
+        if session_name not in self.ssh_sessions or not self.ssh_sessions[session_name].connected:
+            QMessageBox.information(self, "Not connected", f"{session_name} not connected. Click Connect first.")
+            return
+        # if already open, focus
+        for i in range(self.tabs.count()):
+            if self.tabs.tabText(i).startswith(f"📁 {session_name}"):
+                self.tabs.setCurrentIndex(i)
+                return
+        wrapper = self.ssh_sessions[session_name]
+        # find session config for remote_path
+        s = None
+        for sess in load_sessions():
+            if sess.name == session_name:
+                s = sess
+                break
+        ft = FileTransferWidget(ssh_wrapper=wrapper)
+        # set paths
+        if s and s.remote_path and s.remote_path!="~":
+            ft.remote_browser.current_path = s.remote_path
+            ft.remote_browser.path_edit.setText(s.remote_path)
+        ft.set_ssh(wrapper)
+        # connect signals
+        ft.remote_browser.open_terminal_here.connect(lambda path, ssh=wrapper, name=session_name: self.open_remote_terminal_at(ssh, path, name))
+        ft.local_browser.open_terminal_here.connect(lambda path: self.open_local_terminal_at(path))
+        ft.remote_browser.bookmark_requested.connect(lambda path, name=session_name: self.add_bookmark_path(path, name, "remote"))
+        ft.local_browser.bookmark_requested.connect(lambda path, name=session_name: self.add_bookmark_path(path, name, "local"))
+        idx = self.tabs.addTab(ft, f"📁 {session_name} - Files")
+        self.tabs.setCurrentIndex(idx)
+        self.transfer_tabs[session_name]=ft
+        self.job_indicator.set_session(wrapper, session_name)
+
     def new_session(self):
         self.idle_monitor.touch()
         dlg = SessionDialog(self)
@@ -450,42 +603,67 @@ New in PolarTerm:
             self.bookmark_list.addItem("No bookmarks yet — add current folder")
 
     def add_bookmark_current(self):
-        # try to get current remote path from active Files tab
-        cur_path = None
-        session_name = ""
-        # find active FileTransferWidget
+        # try to get current paths from active Files tab (both local and remote)
         cur = self.tabs.currentWidget()
-        if isinstance(cur, FileTransferWidget) and cur.ssh and cur.ssh.connected:
-            cur_path = cur.remote_browser.current_path
-            # find session name for this ssh
-            for name, ssh in self.ssh_sessions.items():
-                if ssh == cur.ssh:
-                    session_name = name
-                    break
-        else:
-            # try any connected transfer tab
+        from gui.file_transfer_widget import FileTransferWidget
+        remote_path = None
+        local_path = None
+        session_name = ""
+        if isinstance(cur, FileTransferWidget):
+            # has both browsers, even if not connected local is always valid
+            local_path = cur.local_browser.current_path
+            if cur.ssh and cur.ssh.connected:
+                remote_path = cur.remote_browser.current_path
+                for name, ssh in self.ssh_sessions.items():
+                    if ssh == cur.ssh:
+                        session_name = name
+                        break
+        if not remote_path and not local_path:
             for name, ft in self.transfer_tabs.items():
                 if ft.ssh and ft.ssh.connected:
-                    cur_path = ft.remote_browser.current_path
+                    remote_path = ft.remote_browser.current_path
+                    local_path = ft.local_browser.current_path
                     session_name = name
                     break
-        if not cur_path:
-            # fallback to session's remote_path or ask
+        # decide which to bookmark: if both available, ask user
+        target_path = None
+        kind = "remote"
+        if remote_path and local_path:
+            # ask
+            from PyQt6.QtWidgets import QInputDialog
+            items = [f"Remote: {remote_path}", f"Local: {local_path}"]
+            choice, ok = QInputDialog.getItem(self, "Bookmark", "Bookmark which current folder?", items, 0, False)
+            if not ok:
+                return
+            if choice.startswith("Local:"):
+                target_path = local_path
+                kind = "local"
+            else:
+                target_path = remote_path
+                kind = "remote"
+        elif remote_path:
+            target_path = remote_path
+            kind = "remote"
+        elif local_path:
+            target_path = local_path
+            kind = "local"
+        else:
             s = self.get_selected_session()
             if s:
-                cur_path = s.remote_path
+                target_path = s.remote_path
                 session_name = s.name
+                kind = "remote"
             else:
-                QMessageBox.information(self, "No folder", "Open a remote Files tab first, then bookmark.")
+                QMessageBox.information(self, "No folder", "Open a Files tab first, then bookmark.")
                 return
-        alias, ok = QInputDialog.getText(self, "Bookmark Folder", f"Alias for {cur_path}:", text=os.path.basename(cur_path.rstrip("/")) or cur_path)
+        alias, ok = QInputDialog.getText(self, "Bookmark Folder", f"Alias for {target_path}:", text=os.path.basename(target_path.rstrip("/")) or target_path)
         if not ok or not alias.strip():
             return
         alias = alias.strip()
-        bm = Bookmark(alias=alias, path=cur_path, session=session_name, kind="remote")
+        bm = Bookmark(alias=alias, path=target_path, session=session_name, kind=kind)
         add_bookmark(bm)
         self.refresh_bookmarks()
-        self.left_status.setText(f"Bookmarked {alias} → {cur_path}")
+        self.left_status.setText(f"Bookmarked {alias} → {target_path}")
 
     def add_bookmark_path(self, path, session_name, kind="remote"):
         alias, ok = QInputDialog.getText(self, "Bookmark Folder", f"Alias for {path}:", text=os.path.basename(path.rstrip("/")) or path)
@@ -528,9 +706,15 @@ New in PolarTerm:
                     elif self.transfer_tabs:
                         target_ft = list(self.transfer_tabs.values())[0]
                 if target_ft:
-                    target_ft.remote_browser.current_path = bm.path
-                    target_ft.remote_browser.path_edit.setText(bm.path)
-                    target_ft.remote_browser.refresh()
+                    # handle both local and remote bookmarks
+                    if bm.kind == "local":
+                        target_ft.local_browser.current_path = bm.path
+                        target_ft.local_browser.path_edit.setText(bm.path)
+                        target_ft.local_browser.refresh()
+                    else:
+                        target_ft.remote_browser.current_path = bm.path
+                        target_ft.remote_browser.path_edit.setText(bm.path)
+                        target_ft.remote_browser.refresh()
                     # also bring tab to front
                     for i in range(self.tabs.count()):
                         if self.tabs.widget(i)==target_ft:
@@ -551,6 +735,14 @@ New in PolarTerm:
                         QMessageBox.information(self, "Bookmark", f"Bookmark path: {bm.path}\nConnect to a session first to jump.")
                 break
         self.idle_monitor.touch()
+
+    def open_bookmark_manager(self):
+        # small dedicated window as requested
+        from gui.bookmark_manager import BookmarkManagerDialog
+        dlg = BookmarkManagerDialog(self, initial_session=self.get_selected_session().name if self.get_selected_session() else "")
+        dlg.exec()
+        self.refresh_bookmarks()
+        self.refresh_sessions()  # in case default changed
 
     def connect_selected(self):
         self.idle_monitor.touch()
