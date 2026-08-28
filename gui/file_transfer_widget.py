@@ -1044,51 +1044,96 @@ class FileTransferWidget(QWidget):
         self._start_transfer("down", local_dir, remote_path)
 
     def do_edit_remote(self, remote_path=None, choose_app=False):
-        if not self.ssh or not self.ssh.connected:
-            QMessageBox.warning(self, "Not connected", "Connect first")
-            return
-        if remote_path is None:
-            remote_path = self.remote_browser.selected_path()
-        if not remote_path:
-            QMessageBox.information(self, "Select", "Select a remote file to edit")
-            return
-        # check is dir?
-        try:
-            attr = self.ssh.sftp_stat(remote_path)
-            if statmod.S_ISDIR(attr.st_mode):
-                QMessageBox.information(self, "Folder", "Can't edit a folder")
-                return
-        except Exception as e:
-            QMessageBox.warning(self, "Error", str(e))
-            return
-        # download to temp
-        from utils.remote_edit import get_tmp_for_remote, open_with_local_app, RemoteEditWatcher
-        tmp = get_tmp_for_remote(self.ssh.host, remote_path)
-        self.status.setText(f"Downloading {os.path.basename(remote_path)} for edit...")
-        try:
-            self.ssh.sftp_get(remote_path, tmp)
-        except Exception as e:
-            QMessageBox.warning(self, "Download failed", str(e))
-            return
-        # open
+        # Use QTimer to defer dialog so context menu has closed (avoids reentrancy crash)
         if choose_app:
-            # ask user to pick app
-            app, ok = QFileDialog.getOpenFileName(self, "Choose app to open file (or cancel for default)", "/usr/bin")
-            if ok and app:
-                subprocess.Popen([app, tmp])
+            # defer to avoid crash when called from context menu
+            QTimer.singleShot(100, lambda: self._do_edit_remote_impl(remote_path, True))
+            return
+        self._do_edit_remote_impl(remote_path, False)
+
+    def _do_edit_remote_impl(self, remote_path=None, choose_app=False):
+        try:
+            if not self.ssh or not self.ssh.connected:
+                QMessageBox.warning(self, "Not connected", "Connect first")
+                return
+            if remote_path is None:
+                remote_path = self.remote_browser.selected_path()
+            if not remote_path:
+                QMessageBox.information(self, "Select", "Select a remote file to edit")
+                return
+            # check is dir?
+            try:
+                attr = self.ssh.sftp_stat(remote_path)
+                if statmod.S_ISDIR(attr.st_mode):
+                    QMessageBox.information(self, "Folder", "Can't edit a folder")
+                    return
+            except Exception as e:
+                QMessageBox.warning(self, "Error", str(e))
+                return
+            # download to temp
+            from utils.remote_edit import get_tmp_for_remote, open_with_local_app, RemoteEditWatcher
+            tmp = get_tmp_for_remote(self.ssh.host, remote_path)
+            self.status.setText(f"Downloading {os.path.basename(remote_path)} for edit...")
+            try:
+                self.ssh.sftp_get(remote_path, tmp)
+            except Exception as e:
+                QMessageBox.warning(self, "Download failed", str(e))
+                return
+            # open
+            opened = False
+            if choose_app:
+                try:
+                    app, ok = QFileDialog.getOpenFileName(self, "Choose app to open file (or cancel for default)", "/usr/bin", "Applications (*.desktop);;Executables (*);;All Files (*)")
+                    if ok and app:
+                        if app.endswith(".desktop"):
+                            desktop_name = os.path.basename(app)
+                            try:
+                                subprocess.Popen(["gtk-launch", desktop_name, tmp], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                                opened = True
+                            except:
+                                try:
+                                    subprocess.Popen(["gio", "open", tmp], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                                    opened = True
+                                except:
+                                    pass
+                        if not opened:
+                            if not os.access(app, os.X_OK):
+                                QMessageBox.warning(self, "Not executable", f"{app} is not executable.\nTrying default opener...")
+                                raise Exception("not executable")
+                            subprocess.Popen([app, tmp], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                            opened = True
+                    if not opened:
+                        open_with_local_app(tmp)
+                        opened = True
+                except Exception as e:
+                    print(f"[Open With] failed {e}, fallback to xdg-open")
+                    try:
+                        open_with_local_app(tmp)
+                        opened = True
+                    except Exception as e2:
+                        QMessageBox.warning(self, "Open failed", f"Could not open with {app}:\n{e}\n{e2}")
+                        return
             else:
-                open_with_local_app(tmp)
-        else:
-            open_with_local_app(tmp)
-        # setup watcher if not already
-        if remote_path in self.watchers:
-            try: self.watchers[remote_path].stop()
-            except: pass
-        watcher = RemoteEditWatcher(self.ssh, remote_path, tmp, parent=self)
-        watcher.uploaded.connect(self._on_edit_uploaded)
-        self.watchers[remote_path] = watcher
-        self.status.setText(f"Editing {os.path.basename(remote_path)} — save in local app to auto-upload")
-        QMessageBox.information(self, "Editing", f"Opened {os.path.basename(remote_path)}\n\nLocal copy: {tmp}\n\nEdit and Save — it will auto-upload to remote.\nWatcher active (poll 1.5s).")
+                try:
+                    open_with_local_app(tmp)
+                    opened = True
+                except Exception as e:
+                    QMessageBox.warning(self, "Open failed", str(e))
+                    return
+            if not opened:
+                return
+            if remote_path in self.watchers:
+                try: self.watchers[remote_path].stop()
+                except: pass
+            watcher = RemoteEditWatcher(self.ssh, remote_path, tmp, parent=self)
+            watcher.uploaded.connect(self._on_edit_uploaded)
+            self.watchers[remote_path] = watcher
+            self.status.setText(f"Editing {os.path.basename(remote_path)} — save in local app to auto-upload")
+            QMessageBox.information(self, "Editing", f"Opened {os.path.basename(remote_path)}\n\nLocal copy: {tmp}\n\nEdit and Save — it will auto-upload to remote.\nWatcher active (poll 1.5s).")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            QMessageBox.warning(self, "Error", f"Open With failed (not crashing):\n{e}")
 
     def _on_edit_uploaded(self, remote_path, ok, msg):
         if ok:
