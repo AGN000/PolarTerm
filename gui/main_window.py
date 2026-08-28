@@ -284,7 +284,9 @@ class MainWindow(QMainWindow):
             ("🌹 Rose Petals", "rose", "Falling rose petals"),
             ("🧊 Ice Crystals", "ice", "Ice crystals & snow"),
             ("🪶 Feather Fall", "feather", "Light feathers drifting"),
-            ("🎭 Mixed", "mixed", "Penguins + roses + ice + feathers"),
+            ("😊 Smiley Rain", "smiley", "Falling smileys"),
+            ("👍 Thumbs Up", "thumbs", "Thumbs up & claps"),
+            ("🎭 Mixed", "mixed", "Penguins + roses + ice + feathers + smileys"),
         ]:
             act = QAction(label, self)
             act.setToolTip(tip)
@@ -330,7 +332,7 @@ class MainWindow(QMainWindow):
         self.btn_fall_welcome.setToolTip("Same icon — click for penguin snow, dropdown for rose/ice/feather. Click shows radio pulse.")
         self.btn_fall_welcome.setStyleSheet("background:#0284c7; color:white; font-weight:bold; padding:8px 12px; border-radius:8px;")
         fall_menu = QMenu(self.btn_fall_welcome)
-        for label, mode in [("🐧 Penguin Snow","penguin"),("🌹 Rose Petals","rose"),("🧊 Ice Crystals","ice"),("🪶 Feather Fall","feather"),("🎭 Mixed","mixed")]:
+        for label, mode in [("🐧 Penguin Snow","penguin"),("🌹 Rose Petals","rose"),("🧊 Ice Crystals","ice"),("🪶 Feather Fall","feather"),("😊 Smiley Rain","smiley"),("👍 Thumbs Up","thumbs"),("🎭 Mixed","mixed")]:
             act = QAction(label, self)
             act.triggered.connect(lambda checked, m=mode, l=label: self.trigger_fall_mode(m, l))
             fall_menu.addAction(act)
@@ -794,7 +796,7 @@ New in PolarTerm:
                 QTimer.singleShot(180, lambda: self.radio_pulse.pulse_at(pos2, self.centralWidget()))
         except: pass
         # cycle mode if clicked same icon repeatedly without menu? keep penguin default
-        label_map = {"penguin":"🐧 Penguin Snow","rose":"🌹 Rose Petals","ice":"🧊 Ice Crystals","feather":"🪶 Feather Fall","mixed":"🎭 Mixed"}
+        label_map = {"penguin":"🐧 Penguin Snow","rose":"🌹 Rose Petals","ice":"🧊 Ice Crystals","feather":"🪶 Feather Fall","smiley":"😊 Smiley Rain","thumbs":"👍 Thumbs Up","mixed":"🎭 Mixed"}
         self.trigger_fall_mode(mode, label_map.get(mode, mode))
 
     def closeEvent(self, event):

@@ -98,13 +98,15 @@ class IdleMonitor(QTimer):
 
 class FallingPenguinsOverlay(QWidget):
     """Full-window overlay with falling particles like MobaXterm easter egg. Supports penguin/rose/ice/feather on same icon."""
-    # mode -> (primary emojis, secondary emojis, colors)
+    # mode -> (primary emojis, secondary emojis, colors) — same PolarTerm icon, multiple falls
     THEMES = {
         "penguin": (["🐧"], ["❄"], ["#0ea5e9"]),
         "rose": (["🌹","🌸","🌷","🥀","🌺"], ["❀"," petals"], ["#f43f5e","#ec4899","#be123c"]),
         "ice": (["🧊","❄","❅","❆","💎"], ["·"], ["#7dd3fc","#0ea5e9","#e0f2fe"]),
         "feather": (["🪶","🕊️","☁️"], ["·"], ["#f8fafc","#e2e8f0","#cbd5e1"]),
-        "mixed": (["🐧","🌹","🧊","🪶","❄"], ["·"], ["#0ea5e9","#f43f5e","#7dd3fc"]),
+        "smiley": (["😊","😄","😃","😁","🙂","😆","🤩","🥳"], ["·"], ["#f59e0b","#facc15","#fde68a"]),
+        "thumbs": (["👍","👏","👌","🤝","👋","🙌","💪"], ["·"], ["#22c55e","#86efac","#bbf7d0"]),
+        "mixed": (["🐧","🌹","🧊","🪶","😊","👍","❄"], ["·"], ["#0ea5e9","#f43f5e","#7dd3fc"]),
     }
     def __init__(self, parent=None):
         super().__init__(parent)
