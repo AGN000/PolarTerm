@@ -60,6 +60,10 @@ class SSHClientWrapper:
 
         self.client.connect(**connect_kwargs)
         self.transport = self.client.get_transport()
+        # keepalive to avoid GNOME force-quit on idle TCP
+        try:
+            self.transport.set_keepalive(20)
+        except: pass
         self.sftp = self.client.open_sftp()
         self.connected = True
 

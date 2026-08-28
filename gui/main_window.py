@@ -2,7 +2,7 @@ import os, sys, time, shlex
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QListWidget, QListWidgetItem,
                              QPushButton, QLabel, QTabWidget, QToolBar, QMessageBox, QInputDialog, QMenu, QFrame,
                              QTextEdit, QLineEdit, QComboBox, QGroupBox, QFormLayout)
-from PyQt6.QtCore import Qt, QSize, QTimer
+from PyQt6.QtCore import Qt, QSize, QTimer, QThread, pyqtSignal
 from PyQt6.QtGui import QAction, QIcon, QFont
 
 from core.config import load_sessions, save_sessions, add_or_update_session, delete_session, Session, load_bookmarks, save_bookmarks, add_bookmark, delete_bookmark, Bookmark
@@ -24,6 +24,34 @@ def _icon_path():
         if os.path.exists(p):
             return p
     return None
+
+class ConnectWorker(QThread):
+    success = pyqtSignal(object, object)  # wrapper, session
+    failed = pyqtSignal(str)
+    def __init__(self, session, password, key_pass):
+        super().__init__()
+        self.session = session
+        self.password = password
+        self.key_pass = key_pass
+        self.wrapper = None
+    def run(self):
+        try:
+            w = SSHClientWrapper()
+            w.connect(host=self.session.host, port=self.session.port, username=self.session.username,
+                      password=self.password, key_path=self.session.key_path, key_passphrase=self.key_pass,
+                      jump_host_str=self.session.jump_host)
+            self.wrapper = w
+            self.success.emit(w, self.session)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.failed.emit(str(e))
+    def cancel(self):
+        try:
+            if self.wrapper:
+                self.wrapper.close()
+        except: pass
+        self.terminate()
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -488,6 +516,9 @@ New in PolarTerm:
 
     def connect_selected(self):
         self.idle_monitor.touch()
+        if hasattr(self, '_connect_worker') and self._connect_worker and self._connect_worker.isRunning():
+            QMessageBox.information(self, "Connecting", "Already connecting, please wait...")
+            return
         s = self.get_selected_session()
         if not s:
             QMessageBox.information(self, "Select", "Select a session and click Connect (or double-click).")
@@ -504,19 +535,39 @@ New in PolarTerm:
             if not ok:
                 return
             password = pw
-        wrapper = SSHClientWrapper()
-        self.left_status.setText(f"Connecting to {s.host}...")
-        from PyQt6.QtWidgets import QApplication; QApplication.processEvents()
-        try:
-            wrapper.connect(host=s.host, port=s.port, username=s.username,
-                            password=password, key_path=s.key_path, key_passphrase=key_pass,
-                            jump_host_str=s.jump_host)
-        except Exception as e:
-            QMessageBox.critical(self, "Connection Failed", f"Could not connect to {s.name}:\n{e}\n\nTips:\n• Check host/port/user\n• Check auth (password/key)\n• Jump host format user@host:port\n• VPN/firewall")
-            self.left_status.setText(f"Failed: {e}")
-            return
+        # Non-blocking connect via worker to avoid GNOME "Not Responding / Force Quit"
+        self.left_status.setText(f"Connecting to {s.host}:{s.port}...")
+        self.btn_connect.setEnabled(False)
+        self.btn_connect.setText("⏳ Connecting...")
+        # show small non-modal progress
+        from PyQt6.QtWidgets import QProgressDialog
+        self._progress = QProgressDialog(f"Connecting to {s.name} ({s.username}@{s.host}:{s.port})...", "Cancel", 0, 0, self)
+        self._progress.setWindowTitle("PolarTerm — Connecting")
+        self._progress.setWindowModality(Qt.WindowModality.NonModal)
+        self._progress.setMinimumDuration(200)
+        self._progress.setCancelButtonText("Cancel")
+        self._progress.canceled.connect(lambda: self._cancel_connect())
+        self._progress.show()
+        self._connect_worker = ConnectWorker(s, password, key_pass)
+        self._connect_worker.success.connect(self._on_connect_success)
+        self._connect_worker.failed.connect(self._on_connect_failed)
+        self._connect_worker.finished.connect(lambda: self._progress.close() if hasattr(self, '_progress') else None)
+        self._connect_worker.start()
+
+    def _cancel_connect(self):
+        if hasattr(self, '_connect_worker') and self._connect_worker.isRunning():
+            self._connect_worker.cancel()
+            self.left_status.setText("Cancelled")
+            self.btn_connect.setEnabled(True)
+            self.btn_connect.setText("▶ Connect")
+
+    def _on_connect_success(self, wrapper, s):
         self.ssh_sessions[s.name] = wrapper
         self.left_status.setText(f"Connected: {s.name}")
+        self.btn_connect.setEnabled(True)
+        self.btn_connect.setText("▶ Connect")
+        if hasattr(self, '_progress'):
+            self._progress.close()
         term = TerminalWidget(ssh_wrapper=wrapper)
         term_idx = self.tabs.addTab(term, f"🖥 {s.name}")
         term.connect_ssh(wrapper)
@@ -530,16 +581,26 @@ New in PolarTerm:
             ft.local_browser.current_path = s.local_path
             ft.local_browser.path_edit.setText(s.local_path)
             ft.local_browser.refresh()
-        # connect Terminal Here & Bookmark signals
         ft.remote_browser.open_terminal_here.connect(lambda path, ssh=wrapper, name=s.name: self.open_remote_terminal_at(ssh, path, name))
         ft.local_browser.open_terminal_here.connect(lambda path: self.open_local_terminal_at(path))
         ft.remote_browser.bookmark_requested.connect(lambda path, name=s.name: self.add_bookmark_path(path, name, "remote"))
         ft.local_browser.bookmark_requested.connect(lambda path, name=s.name: self.add_bookmark_path(path, name, "local"))
-        # job indicator for this session
         self.job_indicator.set_session(wrapper, s.name)
         self.tabs.setCurrentIndex(term_idx)
         self.terminal_tabs[s.name]=term
         self.transfer_tabs[s.name]=ft
+        self._connect_worker = None
+
+    def _on_connect_failed(self, msg):
+        self.btn_connect.setEnabled(True)
+        self.btn_connect.setText("▶ Connect")
+        if hasattr(self, '_progress'):
+            self._progress.close()
+        # find session name from worker if possible
+        sname = self._connect_worker.session.name if hasattr(self, '_connect_worker') and self._connect_worker.session else "session"
+        QMessageBox.critical(self, "Connection Failed", f"Could not connect to {sname}:\n{msg}\n\nTips:\n• Check host/port/user\n• Check auth (password/key)\n• Jump host format user@host:port\n• VPN/firewall\n• Try increasing timeout")
+        self.left_status.setText(f"Failed: {msg}")
+        self._connect_worker = None
 
     def open_local_terminal(self):
         self.idle_monitor.touch()
