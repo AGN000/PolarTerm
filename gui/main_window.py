@@ -144,7 +144,7 @@ class MainWindow(QMainWindow):
         conn_layout.addWidget(self.btn_local)
         lyt.addLayout(conn_layout)
 
-        info = QLabel("Tip: Double-click to connect. SFTP shows files • Right-click → Terminal Here • Drag & drop enabled.")
+        info = QLabel("Tip: Double-click session to connect. If you close Terminal/Files, <b>right-click session → Open Terminal / Open File Manager</b> to reopen without reconnecting. SFTP • Drag & drop • Terminal Here.")
         info.setWordWrap(True)
         info.setStyleSheet("color:#334155; font-size:11px; background:#f0f9ff; padding:6px; border:1px solid #bae6fd; border-radius:6px;")
         lyt.addWidget(info)
@@ -754,10 +754,68 @@ New in PolarTerm:
             QMessageBox.information(self, "Select", "Select a session and click Connect (or double-click).")
             return
         if s.name in self.ssh_sessions and self.ssh_sessions[s.name].connected:
+            # If already connected, allow reopening closed GUIs without reconnecting
+            wrapper = self.ssh_sessions[s.name]
+            has_term = any(k==s.name or k.startswith(s.name+"-term") for k in self.terminal_tabs.keys())
+            # also check actual tabs
             for i in range(self.tabs.count()):
-                if self.tabs.tabText(i).startswith(s.name):
-                    self.tabs.setCurrentIndex(i)
-                    return
+                if self.tabs.tabText(i).startswith(f"🖥 {s.name}"):
+                    has_term = True
+                    break
+            has_files = s.name in self.transfer_tabs
+            for i in range(self.tabs.count()):
+                if self.tabs.tabText(i).startswith(f"📁 {s.name}"):
+                    has_files = True
+                    break
+            if has_term and has_files:
+                # both exist, just focus
+                for i in range(self.tabs.count()):
+                    if self.tabs.tabText(i).startswith(s.name):
+                        self.tabs.setCurrentIndex(i)
+                        return
+            # need to reopen missing ones using existing wrapper
+            if not has_term:
+                term = TerminalWidget(ssh_wrapper=wrapper)
+                try:
+                    channel = wrapper.client.invoke_shell(term="xterm-256color", width=120, height=30)
+                    channel.settimeout(0.0)
+                    term.ssh = wrapper
+                    term.channel = channel
+                    from gui.terminal_widget import ShellReaderThread
+                    term.reader = ShellReaderThread(channel)
+                    term.reader.data_received.connect(term.on_data)
+                    term.reader.disconnected.connect(term.on_disconnect)
+                    term.reader.start()
+                    term.status_label.setText(f"Connected to {wrapper.host} | Reopened terminal for {s.name}")
+                except Exception as e:
+                    term.status_label.setText(f"Terminal error: {e}")
+                idx = self.tabs.addTab(term, f"🖥 {s.name}")
+                self.tabs.setCurrentIndex(idx)
+                key = f"{s.name}-term-{idx}-{int(time.time())}"
+                self.terminal_tabs[key]=term
+                has_term = True
+            if not has_files:
+                ft = FileTransferWidget(ssh_wrapper=wrapper)
+                if s.remote_path and s.remote_path!="~":
+                    ft.remote_browser.current_path = s.remote_path
+                    ft.remote_browser.path_edit.setText(s.remote_path)
+                ft.set_ssh(wrapper)
+                if s.local_path:
+                    ft.local_browser.current_path = s.local_path
+                    ft.local_browser.path_edit.setText(s.local_path)
+                    ft.local_browser.refresh()
+                ft.remote_browser.open_terminal_here.connect(lambda path, ssh=wrapper, name=s.name: self.open_remote_terminal_at(ssh, path, name))
+                ft.local_browser.open_terminal_here.connect(lambda path: self.open_local_terminal_at(path))
+                ft.remote_browser.bookmark_requested.connect(lambda path, name=s.name: self.add_bookmark_path(path, name, "remote"))
+                ft.local_browser.bookmark_requested.connect(lambda path, name=s.name: self.add_bookmark_path(path, name, "local"))
+                idx = self.tabs.addTab(ft, f"📁 {s.name} - Files")
+                self.transfer_tabs[s.name]=ft
+                self.job_indicator.set_session(wrapper, s.name)
+                if not has_term:
+                    self.tabs.setCurrentIndex(idx)
+            # if we reopened, done
+            if has_term or has_files:
+                return
         password = s.password
         key_pass = s.key_passphrase
         if s.auth_method=="password" and not password:
@@ -901,30 +959,28 @@ New in PolarTerm:
 
     def close_tab(self, idx):
         w = self.tabs.widget(idx)
+        # keep SSH alive so you can reopen — only remove tab bookkeeping
         if isinstance(w, TerminalWidget):
             w.close_shell()
             for k,v in list(self.terminal_tabs.items()):
                 if v==w:
                     del self.terminal_tabs[k]
-                    for j in range(self.tabs.count()):
-                        ww = self.tabs.widget(j)
-                        if ww in self.transfer_tabs.values():
-                            if hasattr(ww, 'ssh') and ww.ssh == self.ssh_sessions.get(k.split("-")[0]):
-                                self.tabs.removeTab(j)
-                                break
-                    if k in self.ssh_sessions:
-                        try: self.ssh_sessions[k].close()
-                        except: pass
-                        del self.ssh_sessions[k]
+                    break
+        elif isinstance(w, FileTransferWidget):
+            for k,v in list(self.transfer_tabs.items()):
+                if v==w:
+                    del self.transfer_tabs[k]
                     break
         self.tabs.removeTab(idx)
-        # update job indicator if needed
+        # keep job indicator if any SSH still alive (even with no tabs)
         if not self.ssh_sessions:
             self.job_indicator.clear()
         else:
-            # switch to first remaining
+            # keep showing first session, even if its tabs were closed — so reopen works
             first = list(self.ssh_sessions.items())[0]
-            self.job_indicator.set_session(first[1], first[0])
+            # only clear if that session's tabs are gone but keep indicator
+            # leave indicator as is
+            pass
         if self.tabs.count()==0:
             self.tabs.addTab(self._create_welcome(), "🏠 Home")
 
