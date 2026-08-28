@@ -1,7 +1,7 @@
 import os, pathlib, stat, hashlib, subprocess, tempfile
 from PyQt6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QSplitter, QTableWidget, QTableWidgetItem,
                              QPushButton, QLineEdit, QLabel, QHeaderView, QFileDialog, QProgressBar,
-                             QToolBar, QMessageBox, QMenu)
+                             QToolBar, QMessageBox, QMenu, QDialog)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer, QFileSystemWatcher, QMimeData, QUrl
 from PyQt6.QtGui import QAction, QIcon, QDrag, QShortcut, QKeySequence
 import stat as statmod
@@ -1079,39 +1079,36 @@ class FileTransferWidget(QWidget):
             except Exception as e:
                 QMessageBox.warning(self, "Download failed", str(e))
                 return
-            # open
+            # open - Ubuntu-like Open With dialog (shows app list, not folder)
             opened = False
             if choose_app:
                 try:
-                    app, ok = QFileDialog.getOpenFileName(self, "Choose app to open file (or cancel for default)", "/usr/bin", "Applications (*.desktop);;Executables (*);;All Files (*)")
-                    if ok and app:
-                        if app.endswith(".desktop"):
-                            desktop_name = os.path.basename(app)
-                            try:
-                                subprocess.Popen(["gtk-launch", desktop_name, tmp], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                    from gui.open_with_dialog import OpenWithDialog, launch_with_app
+                    dlg = OpenWithDialog(tmp, self)
+                    # use show to avoid blocking? exec is fine as we are deferred
+                    if dlg.exec() == QDialog.DialogCode.Accepted:
+                        app_info = dlg.get_selected()
+                        if app_info:
+                            # launch with chosen app via its Exec
+                            if launch_with_app(app_info, tmp):
                                 opened = True
-                            except:
-                                try:
-                                    subprocess.Popen(["gio", "open", tmp], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-                                    opened = True
-                                except:
-                                    pass
-                        if not opened:
-                            if not os.access(app, os.X_OK):
-                                QMessageBox.warning(self, "Not executable", f"{app} is not executable.\nTrying default opener...")
-                                raise Exception("not executable")
-                            subprocess.Popen([app, tmp], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                            else:
+                                raise Exception(f"Failed to launch {app_info['name']}")
+                        else:
+                            # Open with Default (xdg-open)
+                            open_with_local_app(tmp)
                             opened = True
-                    if not opened:
-                        open_with_local_app(tmp)
-                        opened = True
+                    else:
+                        # cancelled - don't open, but not crash
+                        self.status.setText("Open With cancelled")
+                        return
                 except Exception as e:
-                    print(f"[Open With] failed {e}, fallback to xdg-open")
+                    print(f"[Open With] dialog failed {e}, fallback to xdg-open")
                     try:
                         open_with_local_app(tmp)
                         opened = True
                     except Exception as e2:
-                        QMessageBox.warning(self, "Open failed", f"Could not open with {app}:\n{e}\n{e2}")
+                        QMessageBox.warning(self, "Open failed", f"Could not open:\n{e}\n{e2}")
                         return
             else:
                 try:
