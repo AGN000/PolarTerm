@@ -103,6 +103,20 @@ class XTermEmbeddedWidget(QWidget):
             self._launch_fallback()
             return
 
+        # Fix: avoid password prompt again for "Terminal Here" / new tabs.
+        # Native ssh needs sshpass for auto-login with password. If password is
+        # provided but sshpass not installed and no key, fallback to emulated
+        # which reuses the existing authenticated channel (no re-prompt).
+        if not self.is_local and self.password and not shutil.which("sshpass"):
+            has_key = self.key_path and os.path.exists(os.path.expanduser(self.key_path or ""))
+            if not has_key:
+                self.status.setText("Native needs sshpass for password auto-login (sudo apt install sshpass) - using emulated (reuses login, no password prompt)")
+                self.status.setStyleSheet("color: #f59e0b; font-size: 11px;")
+                self.fallback_label.setText("Tip: sudo apt install sshpass + xterm for true native, or keep emulated (no password re-prompt)")
+                self.fallback_label.show()
+                self._launch_fallback()
+                return
+
         wid = int(self.container.winId())
         if wid == 0:
             QTimer.singleShot(200, self._launch)

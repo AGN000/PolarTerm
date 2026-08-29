@@ -637,18 +637,21 @@ New in PolarTerm:
                 self.tabs.setCurrentIndex(i)
                 return
         # create new terminal - native xterm if enabled (100% Linux), else emulated pyte
-        if self._native_enabled and HAS_NATIVE and is_native_available():
+        # Decide native vs emulated: avoid password re-prompt by reusing channel
+        sess = None
+        for s in load_sessions():
+            if s.name == session_name:
+                sess = s
+                break
+        use_native = self._should_use_native(session=sess, ssh_wrapper=wrapper)
+        if use_native:
             # Native: embed real xterm with ssh command (separate connection, true native)
-            sess = None
-            for s in load_sessions():
-                if s.name == session_name:
-                    sess = s
-                    break
             if sess:
                 term = XTermEmbeddedWidget(parent=self, host=sess.host, port=sess.port, user=sess.username, password=sess.password, key_path=sess.key_path, is_local=False)
             else:
                 term = XTermEmbeddedWidget(parent=self, host=wrapper.host, port=22, user=wrapper.username, is_local=False)
         else:
+            # Emulated: reuse existing authenticated transport -> NO password prompt (fixes file transfer Terminal Here)
             term = TerminalWidget(ssh_wrapper=wrapper)
             try:
                 channel = wrapper.client.invoke_shell(term="xterm-256color", width=120, height=30)
@@ -660,7 +663,7 @@ New in PolarTerm:
                 term.reader.data_received.connect(term.on_data)
                 term.reader.disconnected.connect(term.on_disconnect)
                 term.reader.start()
-                term.status_label.setText(f"Connected to {wrapper.host} | Shell for {session_name}")
+                term.status_label.setText(f"Connected to {wrapper.host} | Shell for {session_name} (reused, no password)")
                 term.status_label.setStyleSheet("color: #0ea5e9; font-size: 11px;")
             except Exception as e:
                 QMessageBox.warning(self, "Terminal error", str(e))
@@ -1005,8 +1008,9 @@ New in PolarTerm:
         self.btn_connect.setText("▶ Connect")
         if hasattr(self, '_progress'):
             self._progress.close()
-        # Create terminal: native xterm if enabled (true Linux), else emulated pyte
-        if self._native_enabled and HAS_NATIVE and is_native_available():
+        # Create terminal: native xterm if enabled AND can auto-login without re-prompt
+        use_native = self._should_use_native(session=s)
+        if use_native:
             term = XTermEmbeddedWidget(parent=self, host=s.host, port=s.port, user=s.username, password=s.password, key_path=s.key_path, is_local=False)
             term_idx = self.tabs.addTab(term, f"🖥 {s.name} [native]")
         else:
@@ -1079,28 +1083,25 @@ New in PolarTerm:
     def open_remote_terminal_at(self, ssh_wrapper, remote_path, session_name):
         self.idle_monitor.touch()
         safe = remote_path.replace("'", "'\"'\"'")
-        if self._native_enabled and HAS_NATIVE and is_native_available():
-            # Native: new xterm with ssh and cd
-            sess = None
-            for s in load_sessions():
-                if s.name == session_name:
-                    sess = s
-                    break
+        sess = None
+        for s in load_sessions():
+            if s.name == session_name:
+                sess = s
+                break
+        use_native = self._should_use_native(session=sess, ssh_wrapper=ssh_wrapper)
+        if use_native:
+            # Native: new xterm with ssh and cd - only if can auto-login without re-prompt
             if sess:
                 term = XTermEmbeddedWidget(parent=self, host=sess.host, port=sess.port, user=sess.username, password=sess.password, key_path=sess.key_path, is_local=False)
-                # Store path for later cd via wrapper? For native we cd after connect via ssh command wrapper
-                # Instead, launch with cd in command: handled by XTermEmbedded but we need to cd
-                # Workaround: after tab created, send cd via? For native, the ssh session cd must be done via ssh command
-                # So we just open; user can cd manually, or we rely on remote_path in ssh command
             else:
                 term = XTermEmbeddedWidget(parent=self, host=ssh_wrapper.host, port=22, user=ssh_wrapper.username, is_local=False)
             idx = self.tabs.addTab(term, f"🖥 {session_name} - {os.path.basename(remote_path) or remote_path} [native]")
             self.tabs.setCurrentIndex(idx)
             key = f"{session_name}-term-{idx}"
             self.terminal_tabs[key]=term
-            # Try to cd after a delay via sending to native? For native we can't _send, but we could store
             return
-        # Emulated fallback
+        # Emulated fallback - REUSES existing authenticated transport, so NO password prompt (fixes Terminal Here issue)
+        # This is intentional: file transfer "Terminal Here" reuses channel to avoid re-auth
         term = TerminalWidget(ssh_wrapper=ssh_wrapper)
         try:
             channel = ssh_wrapper.client.invoke_shell(term="xterm-256color", width=120, height=30)
@@ -1332,28 +1333,54 @@ New in PolarTerm:
             f"Fixes: backspace now server-driven (0x7f), fonts fallback chain, "
             f"CSI parsing, CR/BS, resize pty, wcwidth.")
 
+    def _should_use_native(self, session=None, ssh_wrapper=None):
+        """Check if native should be used without re-prompting password.
+        Native via xterm needs sshpass for password auto-login; otherwise it will prompt again.
+        For 'Terminal Here' and new tabs we reuse existing channel -> emulated avoids prompt.
+        """
+        if not (self._native_enabled and HAS_NATIVE and is_native_available()):
+            return False
+        # If local terminal, native is fine
+        if session is None and (ssh_wrapper is None or getattr(ssh_wrapper, 'host', None) is None):
+            # Could be local - check caller will pass is_local
+            return True
+        # For remote, check auth
+        if session:
+            # Key auth -> native ok (no password prompt)
+            if session.key_path and os.path.exists(os.path.expanduser(session.key_path)):
+                return True
+            # Password auth -> need sshpass else will prompt again
+            if session.password and session.auth_method == "password":
+                import shutil
+                if shutil.which("sshpass"):
+                    return True
+                else:
+                    return False  # fallback to emulated which reuses connection
+            # No password (key/agent) -> ok
+            return True
+        return True
+
     def _create_terminal(self, ssh_wrapper=None, session=None, is_local=False, local_path=None):
         """Factory: returns native or emulated terminal widget based on toggle."""
-        if self._native_enabled and HAS_NATIVE and is_native_available():
+        # Use helper to avoid password re-prompt
+        use_native = self._should_use_native(session=session, ssh_wrapper=ssh_wrapper) if not is_local else (self._native_enabled and HAS_NATIVE and is_native_available())
+        if use_native:
             try:
                 if is_local:
                     w = XTermEmbeddedWidget(parent=self, is_local=True, local_path=local_path or os.path.expanduser("~"))
                     return w
                 elif session:
-                    # Use EmbeddedTerminalWidget with session details for native ssh
-                    # We keep paramiko SFTP wrapper for file transfer, but terminal uses native ssh
                     w = XTermEmbeddedWidget(parent=self, host=session.host, port=session.port,
                                             user=session.username, password=session.password,
                                             key_path=session.key_path, is_local=False)
                     return w
                 elif ssh_wrapper and hasattr(ssh_wrapper, 'host'):
-                    # Fallback with ssh_wrapper details
                     w = XTermEmbeddedWidget(parent=self, host=getattr(ssh_wrapper,'host',''), port=22,
                                             user=getattr(ssh_wrapper,'username',''), is_local=False)
                     return w
             except Exception as e:
                 print(f"[native] create failed {e}, fallback to emulated")
-        # Fallback emulated
+        # Fallback emulated (reuses existing paramiko transport -> no password re-prompt)
         return TerminalWidget(ssh_wrapper=ssh_wrapper)
 
     def closeEvent(self, event):
