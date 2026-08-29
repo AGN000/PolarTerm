@@ -166,6 +166,9 @@ class TerminalWidget(QWidget):
         self.terminal.installEventFilter(self)
         # Support resizing -> notify pty
         self.terminal.viewport().installEventFilter(self)
+        # Right-click context menu for copy/paste (multi-command)
+        self.terminal.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.terminal.customContextMenuRequested.connect(self._show_context_menu)
 
     def _change_font(self, delta):
         self.font_size = max(6, min(20, self.font_size + delta))
@@ -606,12 +609,13 @@ class TerminalWidget(QWidget):
                         self._send(b'\x03')  # Ctrl-C interrupt like linux terminal
                         return True
                 elif key == Qt.Key.Key_V:
-                    # Paste from clipboard like linux terminal (Ctrl+Shift+V also)
-                    clipboard = QApplication.clipboard()
-                    clip_text = clipboard.text()
+                    # Paste - support single and multi-command paste (like linux terminal)
+                    clip_text = self._get_clipboard_text()
                     if clip_text:
-                        # Send as if typed, handle bracketed paste
-                        self._send(clip_text.encode('utf-8', errors='ignore'))
+                        self._do_paste(clip_text)
+                    else:
+                        self.status_label.setText("Clipboard empty (try Ctrl+Shift+V or Shift+Insert)")
+                        QTimer.singleShot(2000, lambda: self.status_label.setText("Ready" if not self.ssh else f"Connected to {self.ssh.host}" if hasattr(self.ssh,'host') else "Ready"))
                     return True
                 elif key == Qt.Key.Key_L:
                     self.terminal.clear()
@@ -645,12 +649,17 @@ class TerminalWidget(QWidget):
                     self._send(b'\x12')
                     return True
 
-            # Handle bracketed paste Shift+Insert
+            # Handle paste Shift+Insert (and Ctrl+Shift+V already handled via Ctrl+V above)
             if mods & Qt.KeyboardModifier.ShiftModifier and key == Qt.Key.Key_Insert:
-                clipboard = QApplication.clipboard()
-                clip_text = clipboard.text()
+                clip_text = self._get_clipboard_text()
                 if clip_text:
-                    self._send(clip_text.encode('utf-8', errors='ignore'))
+                    self._do_paste(clip_text)
+                return True
+            # Also handle Ctrl+Shift+V explicitly (some envs)
+            if mods == (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier) and key == Qt.Key.Key_V:
+                clip_text = self._get_clipboard_text()
+                if clip_text:
+                    self._do_paste(clip_text)
                 return True
 
             # Handle special keys - linux terminal compatible
@@ -744,10 +753,103 @@ class TerminalWidget(QWidget):
             return False
         return super().eventFilter(obj, event)
 
+    def _show_context_menu(self, pos):
+        from PyQt6.QtWidgets import QMenu
+        menu = QMenu(self.terminal)
+        has_sel = self.terminal.textCursor().hasSelection()
+        act_copy = menu.addAction("Copy (Ctrl+C)" if has_sel else "Copy")
+        act_copy.setEnabled(has_sel)
+        act_paste = menu.addAction("Paste (Ctrl+V) - multi-command")
+        try:
+            has_clip = bool(self._get_clipboard_text())
+        except:
+            has_clip = True
+        act_paste.setEnabled(has_clip)
+        menu.addSeparator()
+        act_clear = menu.addAction("Clear")
+        act = menu.exec(self.terminal.viewport().mapToGlobal(pos))
+        if act == act_copy and has_sel:
+            self.terminal.copy()
+        elif act == act_paste:
+            txt = self._get_clipboard_text()
+            if txt:
+                self._do_paste(txt)
+        elif act == act_clear:
+            self.terminal.clear()
+
+    def _get_clipboard_text(self):
+        """Get clipboard text supporting X11 Clipboard and Selection (Linux)."""
+        try:
+            from PyQt6.QtGui import QClipboard
+            clipboard = QApplication.clipboard()
+            # Try Clipboard first
+            text = clipboard.text(QClipboard.Mode.Clipboard)
+            if not text and clipboard.supportsSelection():
+                text = clipboard.text(QClipboard.Mode.Selection)
+            if not text:
+                # Fallback to plain text() and mimeData
+                text = clipboard.text()
+                if not text:
+                    md = clipboard.mimeData()
+                    if md and md.hasText():
+                        text = md.text()
+            return text
+        except Exception:
+            try:
+                return QApplication.clipboard().text()
+            except:
+                return ""
+
+    def _do_paste(self, text: str):
+        """Handle paste for single and multiple commands (like linux terminal).
+        Supports pasting 1 to N commands separated by newlines. Each \n triggers execution
+        like typed Enter. Shows status for multi-command paste.
+        """
+        if not text:
+            return
+        # Normalize line endings: \r\n -> \n, \r -> \n
+        text = text.replace('\r\n', '\n').replace('\r', '\n')
+        # For terminal, we want to preserve exact newlines; no extra processing
+        # Count commands
+        lines = [l for l in text.split('\n') if l.strip() != "" or text.endswith('\n')]
+        is_multi = len(lines) > 1 or '\n' in text
+        if is_multi:
+            self.status_label.setText(f"Pasting {len([l for l in lines if l.strip()])} commands...")
+            self.status_label.setStyleSheet("color: #0ea5e9; font-size: 11px;")
+            QTimer.singleShot(2500, lambda: self.status_label.setText(f"Connected to {self.ssh.host} | Shell ready" if self.ssh and hasattr(self.ssh,'host') else "Local shell (bash)" if self.local_shell_process else "Ready"))
+            self.status_label.setStyleSheet("color: #4caf50; font-size: 11px;" if self.ssh else "color: #2196f3; font-size: 11px;")
+        # Send in chunks to avoid channel buffer overflow (paramiko ~ 16KB)
+        # For multi-command, send as one block; channel will handle. For huge paste (>16KB), chunk.
+        try:
+            data = text.encode('utf-8', errors='ignore')
+            # Bracketed paste: if pyte screen has bracketed paste enabled, wrap
+            # For now, send raw; shell will handle newlines as Enter like typed.
+            # Chunk if needed
+            CHUNK = 4096
+            if len(data) > CHUNK:
+                for i in range(0, len(data), CHUNK):
+                    chunk = data[i:i+CHUNK]
+                    self._send(chunk)
+                    # Small delay for large paste
+                    if i + CHUNK < len(data):
+                        QTimer.singleShot(5, lambda: None)
+                        # Use processEvents to avoid blocking
+                        QApplication.processEvents()
+            else:
+                self._send(data)
+        except Exception as e:
+            self.terminal.appendPlainText(f"\n[paste error: {e}]\n")
+
     def _send(self, data: bytes):
         try:
             if self.channel and not self.channel.closed:
-                self.channel.send(data)
+                # For large data, ensure all sent (paramiko send may send partial)
+                total = 0
+                while total < len(data):
+                    sent = self.channel.send(data[total:])
+                    if sent == 0:
+                        break
+                    total += sent
             elif self.local_shell_process:
                 self.local_shell_process.write(data)
         except Exception as e:
