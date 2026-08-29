@@ -1,6 +1,10 @@
 PyQt6>=6.4
 paramiko>=3.0
 cryptography>=3.0
+pyte>=0.8.0
+wcwidth>=0.2
+# Native embedded terminal (Linux): uses system xterm (sudo apt install xterm) for 100% native behavior
+# Optional: sshpass for password auto-fill in native xterm (sudo apt install sshpass)
 # NOTE: If you have metadrive (or other old packages with strict pins) installed
 # in your base environment, pip will warn about dependency conflicts.
 # This is NOT a PolarTerm error. Install PolarTerm in a clean venv to isolate:

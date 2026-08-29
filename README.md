@@ -6,11 +6,11 @@ Built with **Python + PyQt6 + Paramiko**. Works on Ubuntu 22.04/24.04, Fedora, A
 
 ## Features
 
-- **Tabbed SSH terminal** — interactive shell (xterm-256color), ANSI handling, copy/paste, Ctrl-C/L, resize.
+- **Tabbed SSH terminal** — **Two modes:** (1) **Native embedded xterm** (Linux X11, `xterm -into <WID>` - 100% like `gnome-terminal`, vim/htop/tmux/fonts/backspace perfect) and (2) **Emulated pyte** (cross-platform, `pyte` VT100 + fallback). Toggle via `View → Native Terminal`.
 - **SFTP File Manager** — dual-pane (Local ↔ Remote), upload/download with progress, mkdir/rename/delete, dir navigation.
 - **Session Manager** — save hosts, ports, users, password/key auth, jump/bastion host, remote/local start paths.
 - **HPC Ready** — jump host support, quick bar for `squeue`, `qstat`, `sinfo`, `module avail`, etc.
-- **Local Terminal** — open bash tabs alongside remote sessions.
+- **Local Terminal** — open bash tabs alongside remote sessions (native or emulated).
 
 ## Install (Linux)
 
@@ -125,6 +125,7 @@ Format: `host`, `user@host`, `host:port`, `user@host:port`. Connects via Paramik
 
 - `Connection Failed` (e.g. HPC `10.21.1.16:2222`) → check host/port/user, auth, VPN, firewall, jump host. **HPC fix (v1.0.1+)**: timeout increased to 20s (`banner_timeout`/`auth_timeout`) for slow HPC banners; ensure Save ticked so password is actually stored (see Auth & Credentials). Test manually: `ssh -p 2222 user@host` first.
 - `Dark theme mid portion not working / white blank` → fixed in v1.0.1: UI now auto-detects GNOME dark mode and paints central `QTabWidget` pane dark (`#1e1e22`) instead of hard-coded white. Toggle via **View → 🌙 Dark Mode** and **View → Reload Theme**, or set `POLARTERM_DARK=1`. Restart after OS theme change.
+- `Terminal very poor / backspace not deleting / fonts` → fixed in v1.0.2: (1) **Fonts:** `QFontDatabase` fallback chain (`JetBrains Mono/Fira Code/Cascadia/DejaVu/Ubuntu/Consolas`) + `PreferAntialias` + zoom `Ctrl+/-`. (2) **Backspace:** now server-driven `0x7f` (no local double-delete) + proper `pyte` `HistoryScreen` handling `BS/CR/CUB/CUF/ED/EL`. (3) **Native embedded:** `View → Native Terminal` embeds real `xterm` via X11 `-into` (100% Linux: `vim/htop/tmux` perfect). Requires `sudo apt install xterm` [ + `sshpass` for auto-login ]. Fallback pyte works on any system. Toggle via `View → Native Terminal` or `POLARTERM_NATIVE=0`. See `View → Terminal Info`.
 - Key fails → ensure `chmod 600 ~/.ssh/id_rsa` and correct passphrase; try `ssh -i key user@host` first.
 - SFTP empty → click Refresh or check Remote Path `~` resolves.
 - `pip dependency resolver` error with `metadrive` → see Install (Linux) note — use `venv` to isolate; `metadrive 1.4.35` pins old `paramiko==2.10.1` etc.

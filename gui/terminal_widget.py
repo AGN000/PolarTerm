@@ -4,6 +4,14 @@ from PyQt6.QtCore import QThread, pyqtSignal, Qt, QTimer
 from PyQt6.QtGui import QFont, QTextCursor, QColor, QPalette, QFontDatabase
 import paramiko
 
+try:
+    import pyte
+    import wcwidth
+    HAS_PYTE = True
+except ImportError:
+    HAS_PYTE = False
+    pyte = None
+
 # --- Font helper: robust monospace selection for any system ---
 def _get_terminal_font(size=10):
     """Return a monospace font that exists on this system. Fallback chain covers Linux/Win/macOS."""
@@ -81,6 +89,21 @@ class TerminalWidget(QWidget):
         self.local_shell_process = None
         # For handling escape sequences statefully
         self._esc_buf = ""
+        # pyte screen for true VT emulation (vim/htop) - fallback to hand-rolled if not available
+        self.use_pyte = HAS_PYTE and os.environ.get("POLARTERM_PYTE", "1").lower() not in ("0", "false")
+        if self.use_pyte:
+            try:
+                cols, rows = 120, 30
+                self.pyte_screen = pyte.HistoryScreen(cols, rows, history=500, ratio=0.5)
+                self.pyte_stream = pyte.Stream(self.pyte_screen)
+            except Exception as e:
+                print(f"[terminal] pyte init failed {e}, fallback to manual")
+                self.use_pyte = False
+                self.pyte_screen = None
+                self.pyte_stream = None
+        else:
+            self.pyte_screen = None
+            self.pyte_stream = None
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -172,6 +195,14 @@ class TerminalWidget(QWidget):
                 self.channel.resize_pty(width=cols, height=rows)
                 if self.ssh and hasattr(self.ssh, 'resize_shell'):
                     self.ssh.resize_shell(cols, rows)
+                # Also resize pyte screen
+                if self.use_pyte and self.pyte_screen:
+                    try:
+                        self.pyte_screen.resize(rows, cols)
+                    except:
+                        # recreate
+                        self.pyte_screen = pyte.HistoryScreen(cols, rows, history=500, ratio=0.5)
+                        self.pyte_stream = pyte.Stream(self.pyte_screen)
         except:
             pass
 
@@ -179,8 +210,16 @@ class TerminalWidget(QWidget):
         self.ssh = ssh_wrapper
         try:
             cols, rows = self._current_cols_rows()
+            # (re-)init pyte screen with correct size
+            if self.use_pyte:
+                try:
+                    self.pyte_screen = pyte.HistoryScreen(cols, rows, history=500, ratio=0.5)
+                    self.pyte_stream = pyte.Stream(self.pyte_screen)
+                except:
+                    pass
             self.channel = self.ssh.open_shell(cols=cols, rows=rows)
-            self.status_label.setText(f"Connected to {self.ssh.host}  |  Shell ready ({cols}x{rows})")
+            mode = "pyte" if self.use_pyte else "native parser"
+            self.status_label.setText(f"Connected to {self.ssh.host}  |  Shell ready ({cols}x{rows}, {mode})")
             self.status_label.setStyleSheet("color: #4caf50; font-size: 11px;")
             # start reader
             self.reader = ShellReaderThread(self.channel)
@@ -211,7 +250,73 @@ class TerminalWidget(QWidget):
 
     def on_data(self, data: str):
         """Linux-like terminal emulation: handle BS, CR, LF, TAB, ESC sequences properly."""
-        # Use QTextCursor to apply terminal semantics
+        # If pyte available, use it for 100% VT100 (vim/htop) then render
+        if self.use_pyte and self.pyte_screen and self.pyte_stream:
+            try:
+                self.pyte_stream.feed(data)
+                # Render pyte screen to QPlainTextEdit
+                # Preserve scrollback: join display + history tail
+                lines = []
+                # Add history if any
+                if hasattr(self.pyte_screen, 'history'):
+                    # history is deque of lines
+                    try:
+                        hist = list(self.pyte_screen.history.top)
+                        # Deduplicate? just show current screen for now
+                        pass
+                    except:
+                        pass
+                # Build full text including scrollback history + current display
+                try:
+                    # HistoryScreen has history.top deque
+                    hist_lines = []
+                    if hasattr(self.pyte_screen, 'history') and hasattr(self.pyte_screen.history, 'top'):
+                        hist_lines = [line.rstrip() for line in list(self.pyte_screen.history.top)]
+                    display = [line.rstrip() for line in self.pyte_screen.display]
+                    if self.pyte_screen.alt_screen:
+                        # Alternate screen (vim/htop) - show only display, no history
+                        text = "\n".join(display).rstrip()
+                        self.terminal.setPlainText(text)
+                    else:
+                        # Normal: history + display, trim leading/trailing empties
+                        all_lines = hist_lines + display
+                        # Remove leading empty from history that are just blank buffer
+                        # Keep last 1000 lines for performance
+                        if len(all_lines) > 1000:
+                            all_lines = all_lines[-1000:]
+                        text = "\n".join(all_lines).rstrip()
+                        # Avoid flicker: only update if changed
+                        if text != self.terminal.toPlainText().rstrip():
+                            self.terminal.setPlainText(text)
+                except Exception as _e:
+                    display = self.pyte_screen.display
+                    text = "\n".join(display).rstrip()
+                    self.terminal.setPlainText(text)
+                # Move cursor to pyte cursor
+                cursor = self.terminal.textCursor()
+                # pyte cursor is 0-indexed
+                try:
+                    cur_y = self.pyte_screen.cursor.y
+                    cur_x = self.pyte_screen.cursor.x
+                    # Move to y line, x column
+                    cursor.movePosition(QTextCursor.MoveOperation.Start)
+                    for _ in range(cur_y):
+                        cursor.movePosition(QTextCursor.MoveOperation.Down)
+                    cursor.movePosition(QTextCursor.MoveOperation.StartOfBlock)
+                    for _ in range(cur_x):
+                        cursor.movePosition(QTextCursor.MoveOperation.Right)
+                    self.terminal.setTextCursor(cursor)
+                except:
+                    cursor.movePosition(QTextCursor.MoveOperation.End)
+                    self.terminal.setTextCursor(cursor)
+                self.terminal.ensureCursorVisible()
+                self.terminal.verticalScrollBar().setValue(self.terminal.verticalScrollBar().maximum())
+                return
+            except Exception as e:
+                print(f"[terminal] pyte feed failed {e}, fallback to manual")
+                # fall through to manual
+
+        # Manual fallback: Use QTextCursor to apply terminal semantics
         cursor = self.terminal.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         self.terminal.setTextCursor(cursor)
