@@ -14,15 +14,41 @@ Built with **Python + PyQt6 + Paramiko**. Works on Ubuntu 22.04/24.04, Fedora, A
 
 ## Install (Linux)
 
+**Recommended — use venv (isolates from system packages like `metadrive`):**
 ```bash
 git clone https://github.com/AGN000/PolarTerm.git
 cd PolarTerm
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
 pip install -r requirements.txt
-# or: pip install PyQt6 paramiko
+python3 main.py
+# later: ./launch.sh  # auto-uses venv if present
+```
+
+**Direct install (if you have no conflicting packages):**
+```bash
+pip install -r requirements.txt
+# or: pip install PyQt6 paramiko cryptography
 python3 main.py
 ```
 
 Requires Python 3.9+.
+
+> **Seen this error?** `ERROR: pip's dependency resolver does not currently take into account all the packages that are installed... metadrive 1.4.35 requires aiofiles==0.4.0...`
+> 
+> This is **not** a PolarTerm bug. You have `metadrive` (or similar) with very old strict pins (`paramiko==2.10.1`, `aiofiles==0.4.0`, etc.) installed in your global environment. PolarTerm needs `paramiko>=3.0` and `cryptography>=3.0`. Fix:
+> ```bash
+> # Option A: isolate with venv (recommended above)
+> python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt
+>
+> # Option B: install missing dep that metadrive wants (silences warning but not the pin conflicts)
+> pip install "aiofiles==0.4.0" cryptography
+>
+> # Option C: ignore resolver warning — PolarTerm still works; the conflicts are metadrive's old pins
+> pip install --no-deps -r requirements.txt  # if you know what you're doing
+> ```
+> `pip check` will keep warning about `metadrive`'s old pins until you update/uninstall it — that's expected.
 
 ### Desktop Launcher (Ubuntu)
 
@@ -79,11 +105,13 @@ Config on Windows: `%APPDATA%\polarterm\sessions.json` (or `%TEMP%\polarterm.log
 
 Config stored at `~/.config/polarterm/sessions.json` (plain JSON; passwords only if you tick “Save”).
 
-## Auth
+## Auth & Credentials
 
-- **Password** — optionally saved (plain text, like PolarTerm). Leave unticked to prompt each time.
-- **Key** — select private key file; handles RSA/Ed25519/ECDSA; passphrase optional.
+- **Password** — saved **encrypted with Fernet** if you tick **"Save password"** (default ON, 0600 perms in `~/.config/polarterm/.key`). If you enter a password but leave Save unchecked, you'll see a warning and it won't be stored (you'll be prompted each time).
+- **Key** — select private key file; handles RSA/Ed25519/ECDSA; passphrase optional (also encrypted if Save ticked).
 - **Agent** — also tries `ssh-agent` keys automatically.
+
+If credentials appear "not saving", ensure **Save password** is ticked in the New/Edit dialog. Check `~/.config/polarterm/sessions.json` — passwords are stored as `enc:...` when saved.
 
 ## Jump Host
 
@@ -95,9 +123,11 @@ Format: `host`, `user@host`, `host:port`, `user@host:port`. Connects via Paramik
 
 ## Troubleshooting
 
-- `Connection Failed` → check host/port/user, auth, VPN, firewall, jump host.
+- `Connection Failed` (e.g. HPC `10.21.1.16:2222`) → check host/port/user, auth, VPN, firewall, jump host. **HPC fix (v1.0.1+)**: timeout increased to 20s (`banner_timeout`/`auth_timeout`) for slow HPC banners; ensure Save ticked so password is actually stored (see Auth & Credentials). Test manually: `ssh -p 2222 user@host` first.
+- `Dark theme mid portion not working / white blank` → fixed in v1.0.1: UI now auto-detects GNOME dark mode and paints central `QTabWidget` pane dark (`#1e1e22`) instead of hard-coded white. Toggle via **View → 🌙 Dark Mode** and **View → Reload Theme**, or set `POLARTERM_DARK=1`. Restart after OS theme change.
 - Key fails → ensure `chmod 600 ~/.ssh/id_rsa` and correct passphrase; try `ssh -i key user@host` first.
 - SFTP empty → click Refresh or check Remote Path `~` resolves.
+- `pip dependency resolver` error with `metadrive` → see Install (Linux) note — use `venv` to isolate; `metadrive 1.4.35` pins old `paramiko==2.10.1` etc.
 
 ## Roadmap
 

@@ -13,6 +13,36 @@ from gui.file_transfer_widget import FileTransferWidget
 from gui.penguin_widget import PenguinIdleWidget, IdleMonitor, FallingPenguinsOverlay, RadioPulseWidget
 from gui.job_indicator import JobIndicatorWidget
 
+def _is_dark_mode(app=None):
+    """Detect system dark mode via palette or styleHints (Qt6.5+)."""
+    try:
+        from PyQt6.QtWidgets import QApplication
+        from PyQt6.QtGui import QPalette
+        a = app or QApplication.instance()
+        if a is not None:
+            # Qt6.5+ has colorScheme()
+            try:
+                hint = a.styleHints()
+                if hasattr(hint, 'colorScheme'):
+                    from PyQt6.QtCore import Qt as _Qt
+                    # ColorScheme.Dark == 1
+                    if hint.colorScheme() == _Qt.ColorScheme.Dark:
+                        return True
+            except: pass
+            bg = a.palette().color(QPalette.ColorRole.Window)
+            return bg.lightness() < 128
+    except:
+        pass
+    # fallback: env var
+    try:
+        import os
+        if os.environ.get("POLARTERM_DARK", "").lower() in ("1","true","dark"):
+            return True
+    except: pass
+    return False
+
+THEME = {}  # populated at runtime by _setup_ui
+
 def _icon_path():
     # try PolarTerm icon
     candidates = [
@@ -37,9 +67,10 @@ class ConnectWorker(QThread):
     def run(self):
         try:
             w = SSHClientWrapper()
+            # HPC hosts (e.g. 10.21.1.16:2222) can be slow to banner; use longer timeouts (15-20s)
             w.connect(host=self.session.host, port=self.session.port, username=self.session.username,
                       password=self.password, key_path=self.session.key_path, key_passphrase=self.key_pass,
-                      jump_host_str=self.session.jump_host)
+                      jump_host_str=self.session.jump_host, timeout=20, banner_timeout=20, auth_timeout=20)
             self.wrapper = w
             self.success.emit(w, self.session)
         except Exception as e:
@@ -70,20 +101,84 @@ class MainWindow(QMainWindow):
         self.refresh_sessions()
 
     def _setup_ui(self):
+        # --- Theme detection: fix dark theme mid-portion display issue ---
+        # The hard-coded light colors made the central QTabWidget pane invisible/washed out
+        # when the OS is in dark mode (white pane + light text). We now adapt.
+        is_dark = _is_dark_mode()
+        if is_dark:
+            # Dark palette - all panels use dark backgrounds so mid portion remains visible
+            THEME.update({
+                "left_bg": "#1e1e22",
+                "list_bg": "#252529",
+                "list_border": "#3a3a3e",
+                "list_item_border": "#2d2d30",
+                "list_selected_bg": "#0e3a5a",
+                "list_selected_fg": "#7dd3fc",
+                "pane_bg": "#1e1e22",  # central QTabWidget pane - was white, now dark so mid portion works
+                "tab_bg": "#2d2d30",
+                "tab_selected_bg": "#1e1e22",
+                "tab_fg": "#cbd5e1",
+                "tab_selected_fg": "#7dd3fc",
+                "text_primary": "#e2e8f0",
+                "text_secondary": "#94a3b8",
+                "text_accent": "#7dd3fc",
+                "group_fg": "#7dd3fc",
+                "info_bg": "#1e293b",
+                "info_fg": "#cbd5e1",
+                "info_border": "#334155",
+                "card_bg": "#252529",
+                "card_border": "#3a3a3e",
+                "hint_bg": "#0f172a",
+                "hint_fg": "#cbd5e1",
+            })
+        else:
+            THEME.update({
+                "left_bg": "#fafafa",
+                "list_bg": "white",
+                "list_border": "#e2e8f0",
+                "list_item_border": "#f1f5f9",
+                "list_selected_bg": "#e0f2fe",
+                "list_selected_fg": "#0c4a6e",
+                "pane_bg": "white",
+                "tab_bg": "#f8fafc",
+                "tab_selected_bg": "white",
+                "tab_fg": "#334155",
+                "tab_selected_fg": "#0284c7",
+                "text_primary": "#334155",
+                "text_secondary": "#64748b",
+                "text_accent": "#0c4a6e",
+                "group_fg": "#0c4a6e",
+                "info_bg": "#f0f9ff",
+                "info_fg": "#334155",
+                "info_border": "#bae6fd",
+                "card_bg": "white",
+                "card_border": "#e2e8f0",
+                "hint_bg": "#0f172a",
+                "hint_fg": "#e2e8f0",
+            })
+        self._is_dark = is_dark
+
         central = QWidget()
         self.setCentralWidget(central)
+        # Central widget background adapts so mid portion is not white-on-dark
+        central.setStyleSheet(f"background: {THEME['pane_bg']};")
         main_layout = QVBoxLayout(central)
         main_layout.setContentsMargins(0,0,0,0)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         main_layout.addWidget(splitter, 1)
+        # splitter handle visible in both themes
+        splitter.setStyleSheet(f"QSplitter::handle {{ background: {THEME['list_border']}; width: 3px; }}" if is_dark else "QSplitter::handle { background: #e2e8f0; width: 2px; }")
+        splitter.setHandleWidth(4)
 
         # LEFT panel
         left = QFrame()
         left.setFrameStyle(QFrame.Shape.StyledPanel)
         left.setMaximumWidth(320)
         left.setMinimumWidth(260)
-        left.setStyleSheet("QFrame { background: #fafafa; }")
+        left.setStyleSheet(f"QFrame {{ background: {THEME['left_bg']}; border: 1px solid {THEME['list_border']}; }}")
+        # store for later theme toggle
+        self.left_panel = left
         lyt = QVBoxLayout(left)
         lyt.setContentsMargins(8,8,8,8)
 
@@ -96,16 +191,16 @@ class MainWindow(QMainWindow):
             ic.setFixedSize(28,28)
             header.addWidget(ic)
         title = QLabel("PolarTerm")
-        title.setStyleSheet("font-size:16px; font-weight:bold; color:#0c4a6e;")
+        title.setStyleSheet(f"font-size:16px; font-weight:bold; color:{THEME['text_accent']};")
         header.addWidget(title)
         header.addStretch()
         ver = QLabel("v1.0")
-        ver.setStyleSheet("color:#0284c7; font-size:10px; background:#e0f2fe; padding:2px 6px; border-radius:8px;")
+        ver.setStyleSheet(f"color:{THEME['tab_selected_fg']}; font-size:10px; background:{THEME['list_selected_bg']}; padding:2px 6px; border-radius:8px;")
         header.addWidget(ver)
         lyt.addLayout(header)
 
         title2 = QLabel("📦 Sessions")
-        title2.setStyleSheet("font-size:13px; font-weight:bold; padding:4px; color:#334155;")
+        title2.setStyleSheet(f"font-size:13px; font-weight:bold; padding:4px; color:{THEME['text_primary']};")
         lyt.addWidget(title2)
 
         btn_row = QHBoxLayout()
@@ -123,10 +218,10 @@ class MainWindow(QMainWindow):
         lyt.addLayout(btn_row)
 
         self.session_list = QListWidget()
-        self.session_list.setStyleSheet("""
-            QListWidget { background:white; border:1px solid #e2e8f0; border-radius:8px; }
-            QListWidget::item { padding:8px; border-bottom:1px solid #f1f5f9; }
-            QListWidget::item:selected { background:#e0f2fe; color:#0c4a6e; }
+        self.session_list.setStyleSheet(f"""
+            QListWidget {{ background:{THEME['list_bg']}; border:1px solid {THEME['list_border']}; border-radius:8px; color:{THEME['text_primary']}; }}
+            QListWidget::item {{ padding:8px; border-bottom:1px solid {THEME['list_item_border']}; }}
+            QListWidget::item:selected {{ background:{THEME['list_selected_bg']}; color:{THEME['list_selected_fg']}; }}
         """)
         self.session_list.doubleClicked.connect(self.connect_selected)
         self.session_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -139,25 +234,25 @@ class MainWindow(QMainWindow):
         self.btn_connect.clicked.connect(self.connect_selected)
         self.btn_local = QPushButton("💻 Open Local Terminal")
         self.btn_local.clicked.connect(self.open_local_terminal)
-        self.btn_local.setStyleSheet("padding:6px; border:1px solid #cbd5e1; border-radius:6px; background:white;")
+        self.btn_local.setStyleSheet(f"padding:6px; border:1px solid {THEME['list_border']}; border-radius:6px; background:{THEME['list_bg']}; color:{THEME['text_primary']};")
         conn_layout.addWidget(self.btn_connect)
         conn_layout.addWidget(self.btn_local)
         lyt.addLayout(conn_layout)
 
         info = QLabel("Tip: Double-click session to connect. If you close Terminal/Files, <b>right-click session → Open Terminal / Open File Manager</b> to reopen without reconnecting. SFTP • Drag & drop • Terminal Here.")
         info.setWordWrap(True)
-        info.setStyleSheet("color:#334155; font-size:11px; background:#f0f9ff; padding:6px; border:1px solid #bae6fd; border-radius:6px;")
+        info.setStyleSheet(f"color:{THEME['info_fg']}; font-size:11px; background:{THEME['info_bg']}; padding:6px; border:1px solid {THEME['info_border']}; border-radius:6px;")
         lyt.addWidget(info)
 
         hpc = QGroupBox("HPC Quick Bar")
-        hpc.setStyleSheet("QGroupBox { font-weight:bold; color:#0c4a6e; }")
+        hpc.setStyleSheet(f"QGroupBox {{ font-weight:bold; color:{THEME['group_fg']}; }} QGroupBox::title {{ color:{THEME['group_fg']}; }}")
         f = QVBoxLayout(hpc)
         self.hpc_cmd = QComboBox()
         self.hpc_cmd.addItems(["Custom...", "squeue -u $USER", "qstat -u $USER", "sinfo -o \"%P %a %l %D %T\"", "qstat", "pestat", "module avail", "pwd; ls -lh", "watch -n2 squeue -u $USER"])
         self.hpc_cmd_edit = QLineEdit()
         self.hpc_cmd_edit.setPlaceholderText("type command to run on remote")
         btn_hpc = QPushButton("Send to Active Terminal")
-        btn_hpc.setStyleSheet("background:#e0f2fe; border:1px solid #7dd3fc; border-radius:6px; padding:6px;")
+        btn_hpc.setStyleSheet(f"background:{THEME['list_selected_bg']}; border:1px solid {THEME['list_border']}; border-radius:6px; padding:6px; color:{THEME['text_primary']};")
         btn_hpc.clicked.connect(self.send_hpc_cmd)
         f.addWidget(self.hpc_cmd)
         f.addWidget(self.hpc_cmd_edit)
@@ -171,13 +266,13 @@ class MainWindow(QMainWindow):
 
         # Bookmarks - small window to bookmark folders for quick jump after login
         bm_box = QGroupBox("🔖 Bookmarks")
-        bm_box.setStyleSheet("QGroupBox { font-weight:bold; color:#0c4a6e; }")
+        bm_box.setStyleSheet(f"QGroupBox {{ font-weight:bold; color:{THEME['group_fg']}; }} QGroupBox::title {{ color:{THEME['group_fg']}; }}")
         bm_lyt = QVBoxLayout(bm_box)
         self.bookmark_list = QListWidget()
-        self.bookmark_list.setStyleSheet("""
-            QListWidget { background:white; border:1px solid #e2e8f0; border-radius:6px; }
-            QListWidget::item { padding:6px; border-bottom:1px solid #f1f5f9; }
-            QListWidget::item:selected { background:#fffbeb; color:#92400e; }
+        self.bookmark_list.setStyleSheet(f"""
+            QListWidget {{ background:{THEME['list_bg']}; border:1px solid {THEME['list_border']}; border-radius:6px; color:{THEME['text_primary']}; }}
+            QListWidget::item {{ padding:6px; border-bottom:1px solid {THEME['list_item_border']}; }}
+            QListWidget::item:selected {{ background:{THEME['list_selected_bg']}; color:{THEME['list_selected_fg']}; }}
         """)
         self.bookmark_list.setMinimumHeight(90)
         self.bookmark_list.setMaximumHeight(160)
@@ -186,7 +281,7 @@ class MainWindow(QMainWindow):
         bm_btn_row = QHBoxLayout()
         self.btn_bm_add = QPushButton("＋ Add")
         self.btn_bm_add.setToolTip("Bookmark current remote folder (from active Files tab)")
-        self.btn_bm_add.setStyleSheet("background:#fffbeb; border:1px solid #fcd34d; padding:4px; border-radius:6px; font-size:11px;")
+        self.btn_bm_add.setStyleSheet(f"background:{THEME['list_selected_bg']}; border:1px solid {THEME['list_border']}; padding:4px; border-radius:6px; font-size:11px; color:{THEME['text_primary']};")
         self.btn_bm_add.clicked.connect(self.add_bookmark_current)
         self.btn_bm_del = QPushButton("✕")
         self.btn_bm_del.setFixedWidth(28)
@@ -203,31 +298,36 @@ class MainWindow(QMainWindow):
         # manager button - small window as requested
         self.btn_bm_manage = QPushButton("📖 Manager — Small Window")
         self.btn_bm_manage.setToolTip("Open dedicated bookmark manager window (add/edit/jump with auto-jump on login)")
-        self.btn_bm_manage.setStyleSheet("background:white; border:1px solid #cbd5e1; padding:4px; border-radius:6px; font-size:11px;")
+        self.btn_bm_manage.setStyleSheet(f"background:{THEME['list_bg']}; border:1px solid {THEME['list_border']}; padding:4px; border-radius:6px; font-size:11px; color:{THEME['text_primary']};")
         self.btn_bm_manage.clicked.connect(self.open_bookmark_manager)
         bm_lyt.addWidget(self.btn_bm_manage)
         # small hint
         bm_hint = QLabel("Double-click to jump. Bookmarks persist and auto-jump option on connect.")
         bm_hint.setWordWrap(True)
-        bm_hint.setStyleSheet("color:#92400e; font-size:9px;")
+        bm_hint.setStyleSheet(f"color:{THEME['text_secondary']}; font-size:9px;")
         bm_lyt.addWidget(bm_hint)
         lyt.addWidget(bm_box)
         self.refresh_bookmarks()
 
         self.left_status = QLabel("Ready")
-        self.left_status.setStyleSheet("color:#64748b; font-size:10px;")
+        self.left_status.setStyleSheet(f"color:{THEME['text_secondary']}; font-size:10px;")
         lyt.addWidget(self.left_status)
 
         splitter.addWidget(left)
 
-        # RIGHT: tab widget
+        # RIGHT: tab widget - THE FIX for dark theme mid-portion
+        # Previously: pane background was hard-coded white, which made the central
+        # area unreadable when OS was in dark mode (white pane + white/light text).
+        # Now we use theme-aware colors so the mid portion renders correctly.
         self.tabs = QTabWidget()
         self.tabs.setTabsClosable(True)
         self.tabs.tabCloseRequested.connect(self.close_tab)
-        self.tabs.setStyleSheet("""
-            QTabWidget::pane { border:1px solid #e2e8f0; background:white; }
-            QTabBar::tab { background:#f8fafc; padding:8px 16px; border:1px solid #e2e8f0; border-bottom:none; margin-right:2px; border-top-left-radius:8px; border-top-right-radius:8px; }
-            QTabBar::tab:selected { background:white; color:#0284c7; font-weight:bold; }
+        self.tabs.setStyleSheet(f"""
+            QTabWidget::pane {{ border:1px solid {THEME['list_border']}; background:{THEME['pane_bg']}; }}
+            QTabBar::tab {{ background:{THEME['tab_bg']}; color:{THEME['tab_fg']}; padding:8px 16px; border:1px solid {THEME['list_border']}; border-bottom:none; margin-right:2px; border-top-left-radius:8px; border-top-right-radius:8px; }}
+            QTabBar::tab:selected {{ background:{THEME['tab_selected_bg']}; color:{THEME['tab_selected_fg']}; font-weight:bold; }}
+            QTabBar::tab:hover {{ background:{THEME['list_selected_bg']}; }}
+            QWidget#qt_tabwidget_stackedwidget {{ background:{THEME['pane_bg']}; }}
         """)
         welcome = self._create_welcome()
         self.tabs.addTab(welcome, "🏠 Home")
@@ -263,6 +363,18 @@ class MainWindow(QMainWindow):
         act_quit.setShortcut("Ctrl+Q")
         act_quit.triggered.connect(self.close)
         m_file.addAction(act_quit)
+        m_view = menubar.addMenu("View")
+        act_dark = QAction("🌙 Dark Mode", self)
+        act_dark.setCheckable(True)
+        act_dark.setChecked(self._is_dark)
+        act_dark.setToolTip("Toggle dark theme for mid portion and panels (restarts welcome). Auto-detected from system; toggle if mid portion looks broken.")
+        act_dark.triggered.connect(self.toggle_dark_mode)
+        m_view.addAction(act_dark)
+        self.act_dark = act_dark
+        act_reload = QAction("↻ Reload Theme", self)
+        act_reload.triggered.connect(self.reload_theme)
+        m_view.addAction(act_reload)
+
         m_help = menubar.addMenu("Help")
         act_about = QAction("About PolarTerm", self)
         act_about.triggered.connect(self.show_about)
@@ -329,17 +441,17 @@ class MainWindow(QMainWindow):
             banner.addWidget(ic)
         col = QVBoxLayout()
         title = QLabel("Welcome to PolarTerm")
-        title.setStyleSheet("font-size:24px; font-weight:bold; color:#0c4a6e;")
+        title.setStyleSheet(f"font-size:24px; font-weight:bold; color:{THEME['text_accent']};")
         col.addWidget(title)
         sub = QLabel("HPC Terminal & File Manager for Linux • Secure • Drag & Drop • Penguin Powered 🐧")
-        sub.setStyleSheet("font-size:13px; color:#475569;")
+        sub.setStyleSheet(f"font-size:13px; color:{THEME['text_secondary']};")
         col.addWidget(sub)
         banner.addLayout(col)
         banner.addStretch()
         # idle demo button + falling button (same icon, multiple animations)
         btn_box = QVBoxLayout()
         btn_peng = QPushButton("🐧 Wake Penguin")
-        btn_peng.setStyleSheet("background:#e0f2fe; border:1px solid #7dd3fc; padding:8px 12px; border-radius:8px;")
+        btn_peng.setStyleSheet(f"background:{THEME['list_selected_bg']}; border:1px solid {THEME['list_border']}; padding:8px 12px; border-radius:8px; color:{THEME['text_primary']};")
         btn_peng.clicked.connect(lambda: self.penguin_widget.start() if not self.penguin_widget.isVisible() else self.penguin_widget.stop())
         btn_box.addWidget(btn_peng)
         # Same PolarTerm icon with rose/ice/feather/penguin cycle + radio pulse
@@ -369,7 +481,7 @@ class MainWindow(QMainWindow):
             ("🐧 Penguin", "Idle animation when\n you stare too long\n like classic MobaXterm"),
         ]:
             card = QLabel(f"<b>{text[0]}</b><br><br>{text[1].replace(chr(10),'<br>')}")
-            card.setStyleSheet("background:white; border:1px solid #e2e8f0; border-radius:10px; padding:14px; font-size:12px;")
+            card.setStyleSheet(f"background:{THEME['card_bg']}; color:{THEME['text_primary']}; border:1px solid {THEME['card_border']}; border-radius:10px; padding:14px; font-size:12px;")
             card.setAlignment(Qt.AlignmentFlag.AlignTop)
             cards.addWidget(card)
         l.addLayout(cards)
@@ -394,7 +506,7 @@ New in PolarTerm:
         l.addWidget(hint)
 
         footer = QLabel("PolarTerm v1.0 • Built with PyQt6 + Paramiko • Shows 🐧 when idle • Icon: polarterm.png")
-        footer.setStyleSheet("color:#64748b; font-size:11px;")
+        footer.setStyleSheet(f"color:{THEME['text_secondary']}; font-size:11px;")
         footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
         l.addWidget(footer)
         l.addStretch()
@@ -1046,6 +1158,37 @@ New in PolarTerm:
         # cycle mode if clicked same icon repeatedly without menu? keep penguin default
         label_map = {"penguin":"🐧 Penguin Snow","rose":"🌹 Rose Petals","ice":"🧊 Ice Crystals","feather":"🪶 Feather Fall","smiley":"😊 Smiley Rain","thumbs":"👍 Thumbs Up","mixed":"🎭 Mixed"}
         self.trigger_fall_mode(mode, label_map.get(mode, mode))
+
+    def toggle_dark_mode(self, checked):
+        # Persist preference: POLARTERM_DARK env override via config file
+        try:
+            import os
+            cfg = os.path.expanduser("~/.config/polarterm/theme.conf")
+            os.makedirs(os.path.dirname(cfg), exist_ok=True)
+            with open(cfg, "w") as f:
+                f.write("dark\n" if checked else "light\n")
+        except: pass
+        QMessageBox.information(self, "Theme", f"{'Dark' if checked else 'Light'} mode will apply on next restart.\n\nMid portion fix: central pane now uses {'dark' if checked else 'light'} background so it's not invisible.\n\nRestart PolarTerm to apply fully (or use View → Reload Theme).")
+        # immediate reload for current session lists/tabs
+        self.reload_theme()
+
+    def reload_theme(self):
+        # re-apply theme without restart (for mid portion)
+        try:
+            is_dark = self.act_dark.isChecked() if hasattr(self, 'act_dark') else _is_dark_mode()
+            # allow env override
+            import os
+            cfg = os.path.expanduser("~/.config/polarterm/theme.conf")
+            if os.path.exists(cfg):
+                try:
+                    v = open(cfg).read().strip().lower()
+                    if v == "dark": is_dark = True
+                    elif v == "light": is_dark = False
+                except: pass
+            QMessageBox.information(self, "Reload Theme",
+                f"Reloading theme as {'dark' if is_dark else 'light'} — restart recommended for full effect.\n\nFix: If mid portion was white/blank in dark OS, restarting will fix it.")
+        except Exception as e:
+            QMessageBox.warning(self, "Theme", str(e))
 
     def closeEvent(self, event):
         for t in self.terminal_tabs.values():

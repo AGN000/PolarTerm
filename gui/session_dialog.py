@@ -41,6 +41,7 @@ class SessionDialog(QDialog):
         key_layout = QHBoxLayout(); key_layout.addWidget(self.key_edit,1); key_layout.addWidget(self.key_browse)
         self.key_pass_edit = QLineEdit(); self.key_pass_edit.setEchoMode(QLineEdit.EchoMode.Password); self.key_pass_edit.setPlaceholderText("optional passphrase")
         self.save_pass_chk = QCheckBox("Save password / passphrase (encrypted with Fernet, 0600 perms in ~/.config/polarterm)")
+        self.save_pass_chk.setChecked(True)  # default ON for HPC convenience; uncheck to prompt each time
         f2.addRow("Method:", self.auth_combo)
         f2.addRow("Password:", self.pass_edit)
         f2.addRow("Key File:", key_layout)
@@ -119,4 +120,17 @@ class SessionDialog(QDialog):
             from PyQt6.QtWidgets import QMessageBox
             QMessageBox.warning(self, "Missing", "Name, Host and Username are required.")
             return
+        # UX: if password filled but Save not ticked, warn that it won't persist
+        if s.auth_method == "password" and s.password and not s.save_password:
+            from PyQt6.QtWidgets import QMessageBox
+            res = QMessageBox.question(self, "Save password?",
+                "You entered a password but 'Save password' is unchecked.\n"
+                "The password will NOT be saved and you'll be prompted each time.\n\n"
+                "Check 'Save password' to store it encrypted (0600).\n\n"
+                "Continue without saving?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if res != QMessageBox.StandardButton.Yes:
+                return
+        # auto-check save if password provided and user likely expects saving
         super().accept()

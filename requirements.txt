@@ -1,2 +1,8 @@
 PyQt6>=6.4
 paramiko>=3.0
+cryptography>=3.0
+# NOTE: If you have metadrive (or other old packages with strict pins) installed
+# in your base environment, pip will warn about dependency conflicts.
+# This is NOT a PolarTerm error. Install PolarTerm in a clean venv to isolate:
+#   python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt
+# See README "Install (Linux) - venv recommended" for details.

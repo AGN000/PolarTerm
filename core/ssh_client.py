@@ -17,7 +17,8 @@ class SSHClientWrapper:
 
     def connect(self, host: str, port: int, username: str,
                 password: str = "", key_path: str = "", key_passphrase: str = "",
-                timeout: int = 10, jump_host_str: str = ""):
+                timeout: int = 15, banner_timeout: int = 15, auth_timeout: int = 15,
+                jump_host_str: str = ""):
         self.client = paramiko.SSHClient()
         self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         self.host = host
@@ -38,27 +39,46 @@ class SSHClientWrapper:
 
         # Handle jump host if provided (e.g. "user@jump:22" or "jump.example.com")
         sock = None
+        jump_client_holder = None
         if jump_host_str:
             # parse jump_host_str
             j_user, j_host, j_port = self._parse_jump(jump_host_str, username)
             # we need to create a jump client
-            jump_client = paramiko.SSHClient()
-            jump_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            jump_client.connect(j_host, port=j_port, username=j_user,
-                                password=password if not pkey else None,
-                                pkey=pkey, timeout=timeout)
-            jump_transport = jump_client.get_transport()
+            jump_client_holder = paramiko.SSHClient()
+            jump_client_holder.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            # portable: handle old paramiko without banner/auth timeout
+            try:
+                jump_client_holder.connect(j_host, port=j_port, username=j_user,
+                                    password=password if not pkey else None,
+                                    pkey=pkey, timeout=timeout, banner_timeout=banner_timeout, auth_timeout=auth_timeout)
+            except TypeError:
+                jump_client_holder.connect(j_host, port=j_port, username=j_user,
+                                    password=password if not pkey else None,
+                                    pkey=pkey, timeout=timeout)
+            jump_transport = jump_client_holder.get_transport()
             dest_addr = (host, port)
             local_addr = (j_host, j_port)
             sock = jump_transport.open_channel("direct-tcpip", dest_addr, local_addr)
+            # keep reference to prevent GC closing the jump transport
+            self._jump_client = jump_client_holder
 
-        connect_kwargs = dict(hostname=host, port=port, username=username, timeout=timeout, sock=sock, allow_agent=True, look_for_keys=True)
+        connect_kwargs = dict(hostname=host, port=port, username=username, timeout=timeout, banner_timeout=banner_timeout, auth_timeout=auth_timeout, sock=sock, allow_agent=True, look_for_keys=True)
         if pkey:
             connect_kwargs["pkey"] = pkey
         else:
             connect_kwargs["password"] = password
 
-        self.client.connect(**connect_kwargs)
+        # Work on any system / any paramiko version (old paramiko <3.0 doesn't have banner_timeout)
+        try:
+            self.client.connect(**connect_kwargs)
+        except TypeError as te:
+            # fallback for old paramiko: remove banner/auth timeout
+            if "banner_timeout" in str(te) or "auth_timeout" in str(te):
+                connect_kwargs.pop("banner_timeout", None)
+                connect_kwargs.pop("auth_timeout", None)
+                self.client.connect(**connect_kwargs)
+            else:
+                raise
         self.transport = self.client.get_transport()
         # keepalive to avoid GNOME force-quit on idle TCP
         try:
