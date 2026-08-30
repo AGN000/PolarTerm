@@ -44,6 +44,116 @@ def _unique_remote_path(ssh, dst):
             return cand
     return dst
 
+def _is_remote_dir(ssh, path):
+    try:
+        attr = ssh.sftp_stat(path)
+        return statmod.S_ISDIR(attr.st_mode)
+    except:
+        return False
+
+def _remote_mkdir_p(ssh, path):
+    # mkdir -p equivalent via SFTP: create each parent if missing
+    path = path.rstrip("/")
+    if not path or path == "/":
+        return
+    # normalize: if path already exists as dir, do nothing
+    try:
+        ssh.sftp_stat(path)
+        return
+    except:
+        pass
+    # recursively ensure parent exists
+    parent = os.path.dirname(path)
+    if parent and parent != path:
+        _remote_mkdir_p(ssh, parent)
+    try:
+        ssh.sftp_mkdir(path)
+    except Exception:
+        # if fails because parent missing or already exists, ignore if now exists
+        try:
+            ssh.sftp_stat(path)
+        except:
+            raise
+
+def _upload_dir_recursive(ssh, local_dir, remote_dir, progress_cb=None):
+    # ensure remote_dir exists
+    _remote_mkdir_p(ssh, remote_dir)
+    for root, dirs, files in os.walk(local_dir):
+        rel = os.path.relpath(root, local_dir)
+        if rel == ".":
+            remote_root = remote_dir
+        else:
+            remote_root = remote_dir.rstrip("/") + "/" + rel.replace(os.sep, "/")
+            _remote_mkdir_p(ssh, remote_root)
+        # ensure subdirs exist (handles empty dirs)
+        for d in dirs:
+            rd = remote_root.rstrip("/") + "/" + d
+            _remote_mkdir_p(ssh, rd)
+        for f in files:
+            local_file = os.path.join(root, f)
+            remote_file = remote_root.rstrip("/") + "/" + f
+            ssh.sftp_put(local_file, remote_file, callback=progress_cb)
+
+def _download_dir_recursive(ssh, remote_dir, local_dir, progress_cb=None):
+    os.makedirs(local_dir, exist_ok=True)
+    attrs = ssh.sftp_listdir(remote_dir)
+    for attr in attrs:
+        name = attr.filename
+        remote_path = remote_dir.rstrip("/") + "/" + name
+        local_path = os.path.join(local_dir, name)
+        if statmod.S_ISDIR(attr.st_mode):
+            _download_dir_recursive(ssh, remote_path, local_path, progress_cb=progress_cb)
+        else:
+            # handle symlink or file
+            try:
+                ssh.sftp_get(remote_path, local_path, callback=progress_cb)
+            except Exception:
+                # try fallback for symlink: skip or readlink?
+                raise
+
+def _remote_copy_dir_recursive_via_sftp(ssh, src, dst):
+    # copy src (remote dir or file) to dst (remote) via temp files (fallback when cp -a fails)
+    attr = ssh.sftp_stat(src)
+    if statmod.S_ISDIR(attr.st_mode):
+        _remote_mkdir_p(ssh, dst)
+        for entry in ssh.sftp_listdir(src):
+            s = src.rstrip("/") + "/" + entry.filename
+            d = dst.rstrip("/") + "/" + entry.filename
+            if statmod.S_ISDIR(entry.st_mode):
+                _remote_copy_dir_recursive_via_sftp(ssh, s, d)
+            else:
+                with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                    tmp_path = tmp.name
+                try:
+                    ssh.sftp_get(s, tmp_path)
+                    ssh.sftp_put(tmp_path, d)
+                finally:
+                    try: os.unlink(tmp_path)
+                    except: pass
+    else:
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            ssh.sftp_get(src, tmp_path)
+            ssh.sftp_put(tmp_path, dst)
+        finally:
+            try: os.unlink(tmp_path)
+            except: pass
+
+def _remote_copy_same_host_try_cp(ssh, src, dst):
+    # try efficient cp -a via exec, return True if succeeded
+    try:
+        def esc(p): return p.replace("'", "'\\''")
+        cmd = f"cp -a '{esc(src)}' '{esc(dst)}'"
+        stdin, stdout, stderr = ssh.exec_command(cmd, timeout=15)
+        # wait for completion
+        exit_status = stdout.channel.recv_exit_status()
+        if exit_status == 0:
+            return True
+    except Exception:
+        pass
+    return False
+
 # --- SFTP worker (same but supports multiple files for drag-drop) ---
 class SFTPWorker(QThread):
     progress = pyqtSignal(int, int, str)
@@ -59,27 +169,57 @@ class SFTPWorker(QThread):
         try:
             if self.direction == "up":
                 if os.path.isdir(self.local_path):
-                    self.finished_signal.emit(False, "Directory upload not supported yet (zip first)")
-                    return
+                    # recursive folder upload
+                    try:
+                        attr = self.ssh.sftp_stat(self.remote_path)
+                        if statmod.S_ISDIR(attr.st_mode):
+                            remote = self.remote_path.rstrip("/") + "/" + os.path.basename(self.local_path)
+                        else:
+                            remote = self.remote_path
+                    except:
+                        remote = self.remote_path
+                    remote = remote.replace("\\", "/")
+                    # ensure duplicate handling already done via _unique paths caller handles, but for SFTPWorker direct call, ensure unique?
+                    def cb(x, y):
+                        self.progress.emit(x, y, os.path.basename(self.local_path))
+                    _upload_dir_recursive(self.ssh, self.local_path, remote, progress_cb=cb)
+                else:
+                    try:
+                        attr = self.ssh.sftp_stat(self.remote_path)
+                        if statmod.S_ISDIR(attr.st_mode):
+                            remote = os.path.join(self.remote_path, os.path.basename(self.local_path))
+                        else:
+                            remote = self.remote_path
+                    except:
+                        remote = self.remote_path
+                    remote = remote.replace("\\", "/")
+                    def cb(x, y):
+                        self.progress.emit(x, y, os.path.basename(self.local_path))
+                    self.ssh.sftp_put(self.local_path, remote, callback=cb)
+            else:
+                # direction down: check if remote is directory
+                is_remote_dir = False
                 try:
                     attr = self.ssh.sftp_stat(self.remote_path)
-                    if statmod.S_ISDIR(attr.st_mode):
-                        remote = os.path.join(self.remote_path, os.path.basename(self.local_path))
-                    else:
-                        remote = self.remote_path
+                    is_remote_dir = statmod.S_ISDIR(attr.st_mode)
                 except:
-                    remote = self.remote_path
-                remote = remote.replace("\\", "/")
-                def cb(x, y):
-                    self.progress.emit(x, y, os.path.basename(self.local_path))
-                self.ssh.sftp_put(self.local_path, remote, callback=cb)
-            else:
-                local = self.local_path
-                if os.path.isdir(local):
-                    local = os.path.join(local, os.path.basename(self.remote_path))
-                def cb(x, y):
-                    self.progress.emit(x, y, os.path.basename(self.remote_path))
-                self.ssh.sftp_get(self.remote_path, local, callback=cb)
+                    is_remote_dir = False
+                if is_remote_dir:
+                    local = self.local_path
+                    # if local is existing directory, create subfolder inside it
+                    if os.path.isdir(local):
+                        local = os.path.join(local, os.path.basename(self.remote_path.rstrip("/")))
+                    # else local is dest path (already includes name)
+                    def cb(x, y):
+                        self.progress.emit(x, y, os.path.basename(self.remote_path))
+                    _download_dir_recursive(self.ssh, self.remote_path, local, progress_cb=cb)
+                else:
+                    local = self.local_path
+                    if os.path.isdir(local):
+                        local = os.path.join(local, os.path.basename(self.remote_path))
+                    def cb(x, y):
+                        self.progress.emit(x, y, os.path.basename(self.remote_path))
+                    self.ssh.sftp_get(self.remote_path, local, callback=cb)
             self.finished_signal.emit(True, "Transfer complete")
         except Exception as e:
             import traceback; traceback.print_exc()
@@ -503,51 +643,72 @@ class FileBrowserWidget(QWidget):
                     else: # cut = move
                         shutil.move(src, dst)
                 elif src_mode=="remote" and dst_mode=="remote":
-                    # remote -> remote on same host (if same ssh)
-                    # use sftp rename for cut, and copy via temp for copy
+                    # remote -> remote on same host (if same ssh) or cross-host
+                    # use sftp rename for cut, and copy via cp -a or recursive temp for copy
                     if CLIPBOARD["src_ssh"] == self.ssh or CLIPBOARD["src_ssh"] is None:
                         if op=="cut":
                             self.ssh.sftp_rename(src, dst)
                         else:
-                            # copy: download to temp then upload
-                            import tempfile
+                            # copy: handle folder or file
+                            is_dir = _is_remote_dir(self.ssh, src)
+                            if is_dir:
+                                if not _remote_copy_same_host_try_cp(self.ssh, src, dst):
+                                    _remote_copy_dir_recursive_via_sftp(self.ssh, src, dst)
+                            else:
+                                # file: try cp -a first, fallback to temp
+                                if not _remote_copy_same_host_try_cp(self.ssh, src, dst):
+                                    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                                        tmp_path = tmp.name
+                                    try:
+                                        self.ssh.sftp_get(src, tmp_path)
+                                        self.ssh.sftp_put(tmp_path, dst)
+                                    finally:
+                                        try: os.unlink(tmp_path)
+                                        except: pass
+                    else:
+                        # different hosts - need cross-host via local temp
+                        is_dir = _is_remote_dir(CLIPBOARD["src_ssh"], src) if CLIPBOARD["src_ssh"] else False
+                        if is_dir:
+                            tmpdir = tempfile.mkdtemp()
+                            try:
+                                # download remote dir to local temp
+                                local_tmp = os.path.join(tmpdir, os.path.basename(src.rstrip("/")))
+                                _download_dir_recursive(CLIPBOARD["src_ssh"], src, local_tmp)
+                                # upload local temp to dst
+                                _upload_dir_recursive(self.ssh, local_tmp, dst)
+                                if op=="cut":
+                                    try:
+                                        CLIPBOARD["src_ssh"].exec_command(f"rm -rf '{src}'", timeout=5)
+                                    except: pass
+                            finally:
+                                try: shutil.rmtree(tmpdir)
+                                except: pass
+                        else:
                             with tempfile.NamedTemporaryFile(delete=False) as tmp:
                                 tmp_path = tmp.name
                             try:
-                                self.ssh.sftp_get(src, tmp_path)
+                                CLIPBOARD["src_ssh"].sftp_get(src, tmp_path)
                                 self.ssh.sftp_put(tmp_path, dst)
+                                if op=="cut":
+                                    try:
+                                        attr = CLIPBOARD["src_ssh"].sftp_stat(src)
+                                        if statmod.S_ISDIR(attr.st_mode):
+                                            CLIPBOARD["src_ssh"].sftp_rmdir(src)
+                                        else:
+                                            CLIPBOARD["src_ssh"].sftp_remove(src)
+                                    except: pass
                             finally:
                                 try: os.unlink(tmp_path)
                                 except: pass
-                    else:
-                        # different hosts - need cross-host via local temp
-                        import tempfile
-                        with tempfile.NamedTemporaryFile(delete=False) as tmp:
-                            tmp_path = tmp.name
-                        try:
-                            CLIPBOARD["src_ssh"].sftp_get(src, tmp_path)
-                            self.ssh.sftp_put(tmp_path, dst)
-                            if op=="cut":
-                                # delete source via its ssh
-                                try:
-                                    attr = CLIPBOARD["src_ssh"].sftp_stat(src)
-                                    if statmod.S_ISDIR(attr.st_mode):
-                                        CLIPBOARD["src_ssh"].sftp_rmdir(src)
-                                    else:
-                                        CLIPBOARD["src_ssh"].sftp_remove(src)
-                                except: pass
-                        finally:
-                            try: os.unlink(tmp_path)
-                            except: pass
                 elif src_mode=="local" and dst_mode=="remote":
-                    # upload
+                    # upload (file or folder)
                     if not self.ssh or not self.ssh.connected:
                         QMessageBox.warning(self, "Not connected", "Connect remote first")
                         return
                     if os.path.isdir(src):
-                        QMessageBox.information(self, "Folder", f"Folder paste not yet recursive: {src}")
-                        continue
-                    self.ssh.sftp_put(src, dst)
+                        _upload_dir_recursive(self.ssh, src, dst)
+                    else:
+                        self.ssh.sftp_put(src, dst)
                     if op=="cut":
                         # delete local source
                         try:
@@ -557,17 +718,25 @@ class FileBrowserWidget(QWidget):
                                 os.remove(src)
                         except: pass
                 elif src_mode=="remote" and dst_mode=="local":
-                    # download
+                    # download (file or folder)
                     if not CLIPBOARD["src_ssh"] or not CLIPBOARD["src_ssh"].connected:
                         QMessageBox.warning(self, "Not connected", "Source no longer connected")
                         return
                     # dst is local path
                     try:
-                        CLIPBOARD["src_ssh"].sftp_get(src, dst)
-                        if op=="cut":
-                            try:
-                                CLIPBOARD["src_ssh"].sftp_remove(src)
-                            except: pass
+                        is_dir = _is_remote_dir(CLIPBOARD["src_ssh"], src)
+                        if is_dir:
+                            _download_dir_recursive(CLIPBOARD["src_ssh"], src, dst)
+                            if op=="cut":
+                                try:
+                                    CLIPBOARD["src_ssh"].exec_command(f"rm -rf '{src}'", timeout=5)
+                                except: pass
+                        else:
+                            CLIPBOARD["src_ssh"].sftp_get(src, dst)
+                            if op=="cut":
+                                try:
+                                    CLIPBOARD["src_ssh"].sftp_remove(src)
+                                except: pass
                     except Exception as e:
                         QMessageBox.warning(self, "Paste failed", str(e))
                         continue
@@ -976,11 +1145,10 @@ class FileTransferWidget(QWidget):
             QMessageBox.warning(self, "Not connected", "Connect first")
             return
         for lp in local_paths:
-            if os.path.isfile(lp):
+            if os.path.exists(lp):
+                # support both files and folders via recursive SFTPWorker
                 self._start_transfer("up", lp, self.remote_browser.current_path)
-            elif os.path.isdir(lp):
-                QMessageBox.information(self, "Folder", f"Folder drop not yet recursive: {lp}\nZip it first.")
-        self.status.setText(f"Dropped {len(local_paths)} files for upload")
+        self.status.setText(f"Dropped {len(local_paths)} items for upload")
 
     def _on_remote_drop_download(self, remote_paths):
         if not self.ssh or not self.ssh.connected:

@@ -1,6 +1,6 @@
-import os, re, select
+import os, re, select, struct, fcntl, termios, pty, signal, sys
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QPlainTextEdit, QHBoxLayout, QPushButton, QLabel, QApplication
-from PyQt6.QtCore import QThread, pyqtSignal, Qt, QTimer
+from PyQt6.QtCore import QThread, pyqtSignal, Qt, QTimer, QSocketNotifier
 from PyQt6.QtGui import QFont, QTextCursor, QColor, QPalette, QFontDatabase
 import paramiko
 
@@ -87,6 +87,9 @@ class TerminalWidget(QWidget):
         self.reader = None
         self._setup_ui()
         self.local_shell_process = None
+        self.local_pty_master = None
+        self.local_pty_pid = None
+        self.local_notifier = None
         # For handling escape sequences statefully
         self._esc_buf = ""
         # pyte screen for true VT emulation (vim/htop) - fallback to hand-rolled if not available
@@ -193,19 +196,22 @@ class TerminalWidget(QWidget):
         super().resizeEvent(event)
         # Notify remote pty of new size on resize (like linux terminal)
         try:
+            cols, rows = self._current_cols_rows()
             if self.channel and not self.channel.closed:
-                cols, rows = self._current_cols_rows()
                 self.channel.resize_pty(width=cols, height=rows)
                 if self.ssh and hasattr(self.ssh, 'resize_shell'):
                     self.ssh.resize_shell(cols, rows)
-                # Also resize pyte screen
-                if self.use_pyte and self.pyte_screen:
-                    try:
-                        self.pyte_screen.resize(rows, cols)
-                    except:
-                        # recreate
-                        self.pyte_screen = pyte.HistoryScreen(cols, rows, history=500, ratio=0.5)
-                        self.pyte_stream = pyte.Stream(self.pyte_screen)
+            # Local pty winsize
+            if hasattr(self, 'local_pty_master') and self.local_pty_master is not None:
+                self._pty_set_winsize(cols, rows)
+            # Also resize pyte screen
+            if self.use_pyte and self.pyte_screen:
+                try:
+                    self.pyte_screen.resize(rows, cols)
+                except:
+                    # recreate
+                    self.pyte_screen = pyte.HistoryScreen(cols, rows, history=500, ratio=0.5)
+                    self.pyte_stream = pyte.Stream(self.pyte_screen)
         except:
             pass
 
@@ -236,16 +242,92 @@ class TerminalWidget(QWidget):
             self.status_label.setStyleSheet("color: #f44336; font-size: 11px;")
 
     def connect_local(self):
-        """Fallback: local bash via QProcess embedded (simple)"""
-        from PyQt6.QtCore import QProcess
+        """Local bash via real pty (job control, proper resize) with QProcess fallback"""
         self.status_label.setText("Local shell (bash)")
         self.status_label.setStyleSheet("color: #2196f3; font-size: 11px;")
+        # Try real pty first (Linux/macOS) for true terminal interface
+        try:
+            if sys.platform.startswith("win"):
+                raise OSError("no pty on win")
+            # forkpty creates pty master/slave and forks
+            pid, fd = pty.fork()
+            if pid == 0:
+                # child: replace with bash
+                try:
+                    os.execvp("bash", ["bash", "-i"])
+                except:
+                    os._exit(1)
+            else:
+                # parent
+                self.local_pty_master = fd
+                self.local_pty_pid = pid
+                self.local_shell_process = None
+                # non-blocking
+                import fcntl as _fcntl
+                flags = _fcntl.fcntl(fd, _fcntl.F_GETFL)
+                _fcntl.fcntl(fd, _fcntl.F_SETFL, flags | os.O_NONBLOCK)
+                # notifier for reading
+                self.local_notifier = QSocketNotifier(fd, QSocketNotifier.Type.Read, self)
+                self.local_notifier.activated.connect(self._on_local_pty_data)
+                self.local_notifier.setEnabled(True)
+                # initial resize to current widget size
+                try:
+                    cols, rows = self._current_cols_rows()
+                    self._pty_set_winsize(cols, rows)
+                except: pass
+                self.terminal.appendPlainText("Local bash started via pty (real terminal, job control). Type commands.\n")
+                return
+        except Exception as e:
+            print(f"[terminal] pty fork failed {e}, fallback to QProcess")
+        # Fallback: QProcess embedded (simple, no job control)
+        from PyQt6.QtCore import QProcess
         self.local_shell_process = QProcess(self)
         self.local_shell_process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         self.local_shell_process.readyReadStandardOutput.connect(self._on_local_data)
         # Use -i for interactive like linux terminal
         self.local_shell_process.start("bash", ["-i"])
-        self.terminal.appendPlainText("Local bash started (interactive). Type commands.\n")
+        self.terminal.appendPlainText("Local bash started (QProcess fallback, no pty). Type commands.\n")
+
+    def _pty_set_winsize(self, cols, rows):
+        if hasattr(self, 'local_pty_master') and self.local_pty_master is not None:
+            try:
+                s = struct.pack("HHHH", rows, cols, 0, 0)
+                fcntl.ioctl(self.local_pty_master, termios.TIOCSWINSZ, s)
+            except: pass
+
+    def _on_local_pty_data(self):
+        try:
+            data = os.read(self.local_pty_master, 8192)
+            if not data:
+                return
+            text = data.decode('utf-8', errors='ignore')
+            self.on_data(text)
+        except OSError as e:
+            # EIO when child exits
+            if e.errno == 5:
+                self._cleanup_local_pty()
+            else:
+                pass
+        except Exception:
+            pass
+
+    def _cleanup_local_pty(self):
+        try:
+            if hasattr(self, 'local_notifier') and self.local_notifier:
+                self.local_notifier.setEnabled(False)
+                self.local_notifier.deleteLater()
+                self.local_notifier = None
+        except: pass
+        try:
+            if hasattr(self, 'local_pty_master') and self.local_pty_master is not None:
+                os.close(self.local_pty_master)
+                self.local_pty_master = None
+        except: pass
+        try:
+            if hasattr(self, 'local_pty_pid') and self.local_pty_pid:
+                os.kill(self.local_pty_pid, signal.SIGHUP)
+                os.waitpid(self.local_pty_pid, os.WNOHANG)
+        except: pass
 
     def _on_local_data(self):
         data = self.local_shell_process.readAllStandardOutput().data().decode(errors='ignore')
@@ -271,30 +353,54 @@ class TerminalWidget(QWidget):
                         pass
                 # Build full text including scrollback history + current display
                 try:
-                    # HistoryScreen has history.top deque
+                    # Preserve trailing spaces on cursor line so single space is visible
+                    # (previous rstrip on display made space invisible until next char)
+                    cur_y_tmp = self.pyte_screen.cursor.y
+                    cur_x_tmp = self.pyte_screen.cursor.x
                     hist_lines = []
                     if hasattr(self.pyte_screen, 'history') and hasattr(self.pyte_screen.history, 'top'):
                         hist_lines = [line.rstrip() for line in list(self.pyte_screen.history.top)]
-                    display = [line.rstrip() for line in self.pyte_screen.display]
-                    if self.pyte_screen.alt_screen:
+                    raw_display = list(self.pyte_screen.display)
+                    display = []
+                    for y, line in enumerate(raw_display):
+                        stripped = line.rstrip()
+                        if y == cur_y_tmp and cur_x_tmp > len(stripped):
+                            # pad with spaces to make cursor column visible
+                            stripped = stripped + " " * (cur_x_tmp - len(stripped))
+                        display.append(stripped)
+                    if getattr(self.pyte_screen, "alt_screen", False):
                         # Alternate screen (vim/htop) - show only display, no history
-                        text = "\n".join(display).rstrip()
+                        text = "\n".join(display).rstrip("\n")
                         self.terminal.setPlainText(text)
                     else:
                         # Normal: history + display, trim leading/trailing empties
                         all_lines = hist_lines + display
-                        # Remove leading empty from history that are just blank buffer
                         # Keep last 1000 lines for performance
                         if len(all_lines) > 1000:
                             all_lines = all_lines[-1000:]
-                        text = "\n".join(all_lines).rstrip()
-                        # Avoid flicker: only update if changed
-                        if text != self.terminal.toPlainText().rstrip():
+                        text = "\n".join(all_lines).rstrip("\n")
+                        # Avoid flicker: only update if changed (compare without trailing \n)
+                        if text != self.terminal.toPlainText().rstrip("\n"):
                             self.terminal.setPlainText(text)
                 except Exception as _e:
-                    display = self.pyte_screen.display
-                    text = "\n".join(display).rstrip()
-                    self.terminal.setPlainText(text)
+                    # Fallback without alt_screen (HistoryScreen has no alt_screen attr)
+                    try:
+                        raw_display = list(self.pyte_screen.display)
+                        # apply same padding for cursor line fallback
+                        cur_y_f = getattr(self.pyte_screen.cursor, 'y', 0)
+                        cur_x_f = getattr(self.pyte_screen.cursor, 'x', 0)
+                        display_f = []
+                        for y, line in enumerate(raw_display):
+                            s = line.rstrip()
+                            if y == cur_y_f and cur_x_f > len(s):
+                                s = s + " " * (cur_x_f - len(s))
+                            display_f.append(s)
+                        text = "\n".join(display_f).rstrip("\n")
+                        self.terminal.setPlainText(text)
+                    except:
+                        display = self.pyte_screen.display
+                        text = "\n".join(display).rstrip("\n")
+                        self.terminal.setPlainText(text)
                 # Move cursor to pyte cursor
                 cursor = self.terminal.textCursor()
                 # pyte cursor is 0-indexed
@@ -802,39 +908,56 @@ class TerminalWidget(QWidget):
 
     def _do_paste(self, text: str):
         """Handle paste for single and multiple commands (like linux terminal).
-        Supports pasting 1 to N commands separated by newlines. Each \n triggers execution
+        Supports pasting 1 to N commands separated by newlines. Each \\n triggers execution
         like typed Enter. Shows status for multi-command paste.
+        Fixes: module purge / module load / source ... pasted together now shows/executes correctly.
         """
         if not text:
             return
-        # Normalize line endings: \r\n -> \n, \r -> \n
+        # Normalize line endings: \\r\\n -> \\n, \\r -> \\n (copied from Windows/editor)
         text = text.replace('\r\n', '\n').replace('\r', '\n')
-        # For terminal, we want to preserve exact newlines; no extra processing
-        # Count commands
-        lines = [l for l in text.split('\n') if l.strip() != "" or text.endswith('\n')]
-        is_multi = len(lines) > 1 or '\n' in text
+        # Count real commands (non-empty)
+        lines_nonempty = [l for l in text.split('\n') if l.strip()]
+        is_multi = len(lines_nonempty) > 1 or '\n' in text
+        # For multi-command, ensure trailing newline so last line executes (user expects)
+        if is_multi and not text.endswith('\n'):
+            text += '\n'
         if is_multi:
-            self.status_label.setText(f"Pasting {len([l for l in lines if l.strip()])} commands...")
+            self.status_label.setText(f"Pasting {len(lines_nonempty)} commands...")
             self.status_label.setStyleSheet("color: #0ea5e9; font-size: 11px;")
+            # restore after 2.5s
             QTimer.singleShot(2500, lambda: self.status_label.setText(f"Connected to {self.ssh.host} | Shell ready" if self.ssh and hasattr(self.ssh,'host') else "Local shell (bash)" if self.local_shell_process else "Ready"))
-            self.status_label.setStyleSheet("color: #4caf50; font-size: 11px;" if self.ssh else "color: #2196f3; font-size: 11px;")
-        # Send in chunks to avoid channel buffer overflow (paramiko ~ 16KB)
-        # For multi-command, send as one block; channel will handle. For huge paste (>16KB), chunk.
+            QTimer.singleShot(2500, lambda: self.status_label.setStyleSheet("color: #4caf50; font-size: 11px;" if self.ssh else "color: #2196f3; font-size: 11px;"))
+        # Send - do NOT use bracketed-paste disable/enable sequences here.
+        # Previous implementation sent \x1b[?2004l / \x1b[?2004h] to the shell stdin which appears
+        # as literal '2004l' / '2004h' / '^[[?2004h' on the remote (see bug report: right-click
+        # inserted '2004lmodule purge' and '^[[?2004h'). Those sequences are terminal -> application
+        # mode switches, not shell input. Just send plain text; line-by-line delay handles
+        # slow `module` Tcl commands so they show correctly.
         try:
             data = text.encode('utf-8', errors='ignore')
-            # Bracketed paste: if pyte screen has bracketed paste enabled, wrap
-            # For now, send raw; shell will handle newlines as Enter like typed.
-            # Chunk if needed
             CHUNK = 4096
-            if len(data) > CHUNK:
-                for i in range(0, len(data), CHUNK):
-                    chunk = data[i:i+CHUNK]
-                    self._send(chunk)
-                    # Small delay for large paste
-                    if i + CHUNK < len(data):
-                        QTimer.singleShot(5, lambda: None)
-                        # Use processEvents to avoid blocking
-                        QApplication.processEvents()
+            if len(data) > CHUNK or is_multi:
+                if is_multi:
+                    lines = text.split('\n')
+                    # lines includes trailing '' after we ensured trailing \n
+                    def send_line(idx=0):
+                        if idx >= len(lines) - 1:
+                            # last '' is just trailing newline already sent, done
+                            return
+                        line = lines[idx]
+                        chunk = (line + '\n').encode('utf-8', errors='ignore')
+                        self._send(chunk)
+                        # 40ms between commands lets `module` Tcl return before next command
+                        QTimer.singleShot(40, lambda: send_line(idx+1))
+                    send_line(0)
+                else:
+                    # Large single paste - chunk with processEvents
+                    for i in range(0, len(data), CHUNK):
+                        chunk = data[i:i+CHUNK]
+                        self._send(chunk)
+                        if i + CHUNK < len(data):
+                            QApplication.processEvents()
             else:
                 self._send(data)
         except Exception as e:
@@ -850,6 +973,8 @@ class TerminalWidget(QWidget):
                     if sent == 0:
                         break
                     total += sent
+            elif hasattr(self, 'local_pty_master') and self.local_pty_master is not None:
+                os.write(self.local_pty_master, data)
             elif self.local_shell_process:
                 self.local_shell_process.write(data)
         except Exception as e:
@@ -862,6 +987,10 @@ class TerminalWidget(QWidget):
         if self.channel:
             try: self.channel.close()
             except: pass
-        if self.local_shell_process:
+        # cleanup local pty
+        try:
+            self._cleanup_local_pty()
+        except: pass
+        if hasattr(self, 'local_shell_process') and self.local_shell_process:
             try: self.local_shell_process.terminate()
             except: pass

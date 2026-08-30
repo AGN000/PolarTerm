@@ -150,3 +150,71 @@ def add_bookmark(bm: Bookmark):
 def delete_bookmark(alias: str, session: str = ""):
     bms = [b for b in load_bookmarks() if not (b.alias == alias and b.session == session)]
     save_bookmarks(bms)
+
+# --- Command Files (bash comments/commands to execute on click) ---
+COMMANDS_FILE = os.path.join(CONFIG_DIR, "command_files.json")
+
+@dataclass
+class CommandFile:
+    alias: str  # display name, unique
+    path: str   # absolute path to .sh file
+    description: str = ""  # optional
+    # we store path only; content is read live from file so edits reflect
+
+def load_command_files() -> List[CommandFile]:
+    _ensure_dir()
+    if not os.path.exists(COMMANDS_FILE):
+        return []
+    try:
+        with open(COMMANDS_FILE, 'r') as f:
+            data = json.load(f)
+        # support old format where items may be strings
+        out = []
+        for b in data:
+            if isinstance(b, dict) and "alias" in b and "path" in b:
+                out.append(CommandFile(alias=b.get("alias",""), path=b.get("path",""), description=b.get("description","")))
+        return out
+    except: return []
+
+def save_command_files(cfs: List[CommandFile]):
+    _ensure_dir()
+    with open(COMMANDS_FILE, 'w') as f:
+        json.dump([asdict(b) for b in cfs], f, indent=2)
+    try: os.chmod(COMMANDS_FILE, 0o600)
+    except: pass
+
+def add_command_file(cf: CommandFile):
+    cfs = load_command_files()
+    for i, b in enumerate(cfs):
+        if b.alias == cf.alias:
+            cfs[i] = cf
+            save_command_files(cfs)
+            return
+    cfs.append(cf)
+    save_command_files(cfs)
+
+def delete_command_file(alias: str):
+    cfs = [b for b in load_command_files() if b.alias != alias]
+    save_command_files(cfs)
+
+def get_command_file_commands(cf: CommandFile) -> List[str]:
+    """Read file and return executable lines (strip, keep non-empty non-comment or all)."""
+    if not os.path.exists(cf.path):
+        return []
+    try:
+        with open(cf.path, 'r', errors='ignore') as f:
+            lines = f.read().splitlines()
+        # Keep lines that are not empty; preserve comments as context but not executed alone?
+        # User said files has bash comments which will executed -> treat every non-empty line as command
+        # We'll return all non-empty lines; caller can filter comments if needed
+        out = []
+        for l in lines:
+            stripped = l.strip()
+            if not stripped:
+                continue
+            # keep comment lines as well but they won't execute (bash will treat # as comment)
+            # To avoid sending pure comments, we keep them - bash will ignore
+            out.append(l.rstrip("\n"))
+        return out
+    except:
+        return []

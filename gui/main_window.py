@@ -5,13 +5,23 @@ from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSp
 from PyQt6.QtCore import Qt, QSize, QTimer, QThread, pyqtSignal
 from PyQt6.QtGui import QAction, QIcon, QFont
 
-from core.config import load_sessions, save_sessions, add_or_update_session, delete_session, Session, load_bookmarks, save_bookmarks, add_bookmark, delete_bookmark, Bookmark
+from core.config import (load_sessions, save_sessions, add_or_update_session, delete_session, Session,
+                             load_bookmarks, save_bookmarks, add_bookmark, delete_bookmark, Bookmark,
+                             load_command_files, save_command_files, add_command_file, delete_command_file, CommandFile, get_command_file_commands)
 from core.ssh_client import SSHClientWrapper
 from gui.session_dialog import SessionDialog
 from gui.terminal_widget import TerminalWidget
 from gui.file_transfer_widget import FileTransferWidget
 from gui.penguin_widget import PenguinIdleWidget, IdleMonitor, FallingPenguinsOverlay, RadioPulseWidget
 from gui.job_indicator import JobIndicatorWidget
+# Real VTE via QTermWidget (Qt) with fallback to improved TerminalWidget (pyte + pty)
+try:
+    from gui.qterm_widget import RealTerminalWidget, is_qterm_available
+    HAS_QTERM = is_qterm_available()
+except ImportError:
+    HAS_QTERM = False
+    RealTerminalWidget = TerminalWidget
+    def is_qterm_available(): return False
 # Native embedded terminal (xterm via X11) - 100% Linux behavior, fallback to emulated
 try:
     from gui.native_terminal import EmbeddedTerminalWidget, is_native_available, XTermEmbeddedWidget
@@ -319,6 +329,51 @@ class MainWindow(QMainWindow):
         lyt.addWidget(bm_box)
         self.refresh_bookmarks()
 
+        # Commands - bash files to execute on click (multiple files, each with name)
+        cmd_box = QGroupBox("⚡ Commands")
+        cmd_box.setStyleSheet(f"QGroupBox {{ font-weight:bold; color:{THEME['group_fg']}; }} QGroupBox::title {{ color:{THEME['group_fg']}; }}")
+        cmd_lyt = QVBoxLayout(cmd_box)
+        self.command_list = QListWidget()
+        self.command_list.setStyleSheet(f"""
+            QListWidget {{ background:{THEME['list_bg']}; border:1px solid {THEME['list_border']}; border-radius:6px; color:{THEME['text_primary']}; }}
+            QListWidget::item {{ padding:6px; border-bottom:1px solid {THEME['list_item_border']}; }}
+            QListWidget::item:selected {{ background:{THEME['list_selected_bg']}; color:{THEME['list_selected_fg']}; }}
+        """)
+        self.command_list.setMinimumHeight(90)
+        self.command_list.setMaximumHeight(160)
+        self.command_list.doubleClicked.connect(self.run_command_file)
+        self.command_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.command_list.customContextMenuRequested.connect(self.on_command_context_menu)
+        cmd_lyt.addWidget(self.command_list)
+        cmd_btn_row = QHBoxLayout()
+        self.btn_cmd_add = QPushButton("＋ Add")
+        self.btn_cmd_add.setToolTip("Add existing .sh file")
+        self.btn_cmd_add.setStyleSheet(f"background:{THEME['list_selected_bg']}; border:1px solid {THEME['list_border']}; padding:4px; border-radius:6px; font-size:11px; color:{THEME['text_primary']};")
+        self.btn_cmd_add.clicked.connect(self.add_command_file)
+        self.btn_cmd_del = QPushButton("✕")
+        self.btn_cmd_del.setFixedWidth(28)
+        self.btn_cmd_del.setToolTip("Remove selected")
+        self.btn_cmd_del.clicked.connect(self.del_command_file)
+        self.btn_cmd_run = QPushButton("▶ Run")
+        self.btn_cmd_run.setToolTip("Run all commands in selected file in active terminal")
+        self.btn_cmd_run.setStyleSheet("background:#0284c7; color:white; padding:4px 8px; border-radius:6px; font-size:11px;")
+        self.btn_cmd_run.clicked.connect(self.run_command_file)
+        cmd_btn_row.addWidget(self.btn_cmd_add)
+        cmd_btn_row.addWidget(self.btn_cmd_del)
+        cmd_btn_row.addWidget(self.btn_cmd_run)
+        cmd_lyt.addLayout(cmd_btn_row)
+        self.btn_cmd_manage = QPushButton("📖 Manager — Select & Run")
+        self.btn_cmd_manage.setToolTip("Open command manager to preview lines and run selected")
+        self.btn_cmd_manage.setStyleSheet(f"background:{THEME['list_bg']}; border:1px solid {THEME['list_border']}; padding:4px; border-radius:6px; font-size:11px; color:{THEME['text_primary']};")
+        self.btn_cmd_manage.clicked.connect(self.open_command_manager)
+        cmd_lyt.addWidget(self.btn_cmd_manage)
+        cmd_hint = QLabel("Double-click file to run all. Manager lets you run selected lines.")
+        cmd_hint.setWordWrap(True)
+        cmd_hint.setStyleSheet(f"color:{THEME['text_secondary']}; font-size:9px;")
+        cmd_lyt.addWidget(cmd_hint)
+        lyt.addWidget(cmd_box)
+        self.refresh_commands()
+
         self.left_status = QLabel("Ready")
         self.left_status.setStyleSheet(f"color:{THEME['text_secondary']}; font-size:10px;")
         lyt.addWidget(self.left_status)
@@ -396,6 +451,17 @@ class MainWindow(QMainWindow):
         if not (HAS_NATIVE and is_native_available()):
             tip = "Install xterm for native: sudo apt install xterm - then restart"
             act_native.setToolTip(tip + " (currently fallback emulated)")
+        # QTermWidget real VTE (Qt) - works on Wayland, true pty, vim/htop, bracketed-paste
+        act_qterm = QAction("✨ Real VTE (QTermWidget) - Wayland + pty", self)
+        act_qterm.setCheckable(True)
+        act_qterm.setChecked(HAS_QTERM)
+        act_qterm.setEnabled(HAS_QTERM)
+        act_qterm.setToolTip("Real VTE via QTermWidget (libqtermwidget). Works on Wayland/X11, true pty job control. Install: sudo apt install libqtermwidget5-1 python3-pyqt5.qtermwidget or pip build from lxqt/qtermwidget Qt6. Fallback is improved pyte+pty.")
+        act_qterm.triggered.connect(self.toggle_qterm)
+        m_view.addAction(act_qterm)
+        self.act_qterm = act_qterm
+        if not HAS_QTERM:
+            act_qterm.setToolTip("Install QTermWidget for real VTE: sudo apt install libqtermwidget5-1 python3-pyqt5.qtermwidget (Qt5) or build Qt6 qtermwidget. Currently using improved pyte+pty (also real pty for local).")
         m_view.addSeparator()
         act_term_info = QAction("ℹ Terminal Info", self)
         act_term_info.triggered.connect(self.show_terminal_info)
@@ -413,6 +479,15 @@ class MainWindow(QMainWindow):
         act_bm_add = QAction("＋ Add Current Folder", self)
         act_bm_add.triggered.connect(self.add_bookmark_current)
         m_bm.addAction(act_bm_add)
+        m_cmd = menubar.addMenu("⚡ Commands")
+        act_cmd_manager = QAction("📖 Command Manager", self)
+        act_cmd_manager.setShortcut("Ctrl+Shift+C")
+        act_cmd_manager.setToolTip("Manage bash command files - add multiple files, each with name, run in terminal on click")
+        act_cmd_manager.triggered.connect(self.open_command_manager)
+        m_cmd.addAction(act_cmd_manager)
+        act_cmd_add = QAction("＋ Add Command File", self)
+        act_cmd_add.triggered.connect(self.add_command_file)
+        m_cmd.addAction(act_cmd_add)
 
         tb = QToolBar("Main")
         tb.setIconSize(QSize(16,16))
@@ -896,6 +971,169 @@ New in PolarTerm:
         self.refresh_bookmarks()
         self.refresh_sessions()  # in case default changed
 
+    # --- Command Files ---
+    def refresh_commands(self):
+        if not hasattr(self, 'command_list'):
+            return
+        self.command_list.clear()
+        for cf in load_command_files():
+            exists = "✅" if os.path.exists(cf.path) else "⚠️"
+            txt = f"{exists} {cf.alias} → {os.path.basename(cf.path)}"
+            if cf.description:
+                txt += f"  ({cf.description})"
+            item = QListWidgetItem(txt)
+            item.setData(Qt.ItemDataRole.UserRole, cf.alias)
+            item.setToolTip(f"{cf.alias}\n{cf.path}\n{cf.description}")
+            if not os.path.exists(cf.path):
+                item.setForeground(Qt.GlobalColor.red)
+            self.command_list.addItem(item)
+        if self.command_list.count()==0:
+            self.command_list.addItem("No command files yet — click ＋ Add")
+
+    def add_command_file(self):
+        from PyQt6.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getOpenFileName(self, "Select Bash Command File", os.path.expanduser("~"), "Shell Scripts (*.sh *.bash *.txt);;All Files (*)")
+        if not path:
+            return
+        alias, ok = QInputDialog.getText(self, "Command File Name", f"Display name for\n{path}:", text=os.path.splitext(os.path.basename(path))[0] or "commands")
+        if not ok or not alias.strip():
+            return
+        alias = alias.strip()
+        for cf in load_command_files():
+            if cf.alias == alias:
+                QMessageBox.warning(self, "Exists", f"Name '{alias}' already exists.")
+                return
+        desc, _ = QInputDialog.getText(self, "Description", "Description (optional):")
+        cf = CommandFile(alias=alias, path=path, description=desc.strip() if desc else "")
+        add_command_file(cf)
+        self.refresh_commands()
+        self.left_status.setText(f"Added command file {alias}")
+
+    def del_command_file(self):
+        item = self.command_list.currentItem()
+        if not item or not item.data(Qt.ItemDataRole.UserRole):
+            return
+        alias = item.data(Qt.ItemDataRole.UserRole)
+        if QMessageBox.question(self, "Remove", f"Remove '{alias}' from list?\n(File on disk not deleted)") == QMessageBox.StandardButton.Yes:
+            delete_command_file(alias)
+            self.refresh_commands()
+
+    def _get_active_terminal_for_commands(self):
+        cur = self.tabs.currentWidget()
+        from gui.file_transfer_widget import FileTransferWidget
+        if cur and hasattr(cur, '_send') and not isinstance(cur, FileTransferWidget):
+            # also check native which doesn't have _send for remote
+            try:
+                from gui.native_terminal import XTermEmbeddedWidget
+                if isinstance(cur, XTermEmbeddedWidget):
+                    # native xterm - cannot auto-send, inform
+                    return None, "native"
+            except: pass
+            return cur, "ok"
+        # fallback to any terminal
+        for t in self.terminal_tabs.values():
+            if hasattr(t, '_send'):
+                try:
+                    from gui.native_terminal import XTermEmbeddedWidget
+                    if isinstance(t, XTermEmbeddedWidget):
+                        continue
+                except: pass
+                return t, "ok"
+        return None, "none"
+
+    def run_command_file(self):
+        item = self.command_list.currentItem()
+        if not item or not item.data(Qt.ItemDataRole.UserRole):
+            # try selected alias from double click
+            if item and item.text().startswith("No command"):
+                return
+            QMessageBox.information(self, "Select", "Select a command file first.")
+            return
+        alias = item.data(Qt.ItemDataRole.UserRole)
+        cf = next((c for c in load_command_files() if c.alias==alias), None)
+        if not cf or not os.path.exists(cf.path):
+            QMessageBox.warning(self, "Not found", f"File not found:\n{cf.path if cf else 'unknown'}")
+            return
+        cmds = get_command_file_commands(cf)
+        if not cmds:
+            QMessageBox.information(self, "Empty", "File has no commands.")
+            return
+        term, status = self._get_active_terminal_for_commands()
+        if status == "native":
+            QMessageBox.information(self, "Native Terminal", "Native xterm cannot receive auto-commands. Switch to emulated terminal (View → uncheck Native) or use QTermWidget.")
+            return
+        if not term:
+            QMessageBox.information(self, "No terminal", "Open a terminal tab first (SSH or Local).")
+            return
+        # join and send via _do_paste for proper multi-line handling (40ms spacing, no 2004 leak)
+        text = "\n".join(cmds)
+        if not text.endswith("\n"):
+            text += "\n"
+        try:
+            if hasattr(term, '_do_paste'):
+                term._do_paste(text)
+            else:
+                term._send(text.encode())
+            self.left_status.setText(f"Sent {len(cmds)} commands from '{alias}' to terminal")
+            # bring terminal to front
+            for i in range(self.tabs.count()):
+                if self.tabs.widget(i) == term:
+                    self.tabs.setCurrentIndex(i)
+                    break
+        except Exception as e:
+            QMessageBox.warning(self, "Send failed", str(e))
+
+    def on_command_context_menu(self, pos):
+        item = self.command_list.itemAt(pos)
+        if not item or not item.data(Qt.ItemDataRole.UserRole):
+            return
+        alias = item.data(Qt.ItemDataRole.UserRole)
+        cf = next((c for c in load_command_files() if c.alias==alias), None)
+        if not cf:
+            return
+        menu = QMenu(self)
+        act_run = menu.addAction("▶ Run All in Terminal")
+        act_preview = menu.addAction("👁 Preview / Run Selected Lines...")
+        menu.addSeparator()
+        act_edit = menu.addAction("📝 Edit File (xdg-open)")
+        act_rename = menu.addAction("✏️ Rename")
+        act_remove = menu.addAction("✕ Remove from List")
+        act = menu.exec(self.command_list.viewport().mapToGlobal(pos))
+        if act == act_run:
+            self.command_list.setCurrentItem(item)
+            self.run_command_file()
+        elif act == act_preview:
+            self.open_command_manager()
+        elif act == act_edit:
+            import subprocess
+            try:
+                subprocess.Popen(["xdg-open", cf.path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except:
+                QMessageBox.information(self, "Edit", cf.path)
+        elif act == act_rename:
+            new_alias, ok = QInputDialog.getText(self, "Rename", "New name:", text=alias)
+            if ok and new_alias.strip() and new_alias.strip()!=alias:
+                new_alias = new_alias.strip()
+                if any(c.alias==new_alias for c in load_command_files()):
+                    QMessageBox.warning(self, "Exists", f"Name '{new_alias}' exists.")
+                    return
+                cfs = load_command_files()
+                for c in cfs:
+                    if c.alias==alias:
+                        c.alias=new_alias
+                        break
+                save_command_files(cfs)
+                self.refresh_commands()
+        elif act == act_remove:
+            self.command_list.setCurrentItem(item)
+            self.del_command_file()
+
+    def open_command_manager(self):
+        from gui.command_manager import CommandManagerDialog
+        dlg = CommandManagerDialog(self)
+        dlg.exec()
+        self.refresh_commands()
+
     def connect_selected(self):
         self.idle_monitor.touch()
         if hasattr(self, '_connect_worker') and self._connect_worker and self._connect_worker.isRunning():
@@ -1052,7 +1290,12 @@ New in PolarTerm:
         self.idle_monitor.touch()
         import datetime
         name = f"Local-{datetime.datetime.now().strftime('%H%M%S')}"
-        if self._native_enabled and HAS_NATIVE and is_native_available():
+        # Prefer QTermWidget real VTE when available (Wayland compatible), then native xterm, else improved pyte+pty
+        if HAS_QTERM and is_qterm_available():
+            term = RealTerminalWidget(parent=self, is_local=True)
+            idx = self.tabs.addTab(term, f"💻 {name} [QTerm]")
+            term.connect_local()
+        elif self._native_enabled and HAS_NATIVE and is_native_available():
             term = XTermEmbeddedWidget(parent=self, is_local=True, local_path=os.path.expanduser("~"))
             idx = self.tabs.addTab(term, f"💻 {name} [native]")
         else:
@@ -1065,6 +1308,17 @@ New in PolarTerm:
 
     def open_local_terminal_at(self, path):
         self.idle_monitor.touch()
+        if HAS_QTERM and is_qterm_available():
+            term = RealTerminalWidget(parent=self, is_local=True)
+            idx = self.tabs.addTab(term, f"💻 {os.path.basename(path) or path} [QTerm]")
+            term.connect_local()
+            self.tabs.setCurrentIndex(idx)
+            key = f"local-{path}-{idx}"
+            self.terminal_tabs[key]=term
+            # need cd handling? QTermWidget already starts in home, send cd
+            try: QTimer.singleShot(600, lambda: term._send(f"cd '{path.replace(chr(39), chr(39)+'\"'+chr(39)+'\"'+chr(39))}' && pwd\n".encode()))
+            except: pass
+            return
         if self._native_enabled and HAS_NATIVE and is_native_available():
             term = XTermEmbeddedWidget(parent=self, is_local=True, local_path=path)
             idx = self.tabs.addTab(term, f"💻 {os.path.basename(path) or path} [native]")
@@ -1304,6 +1558,20 @@ New in PolarTerm:
             f"{'Native embeds real xterm via X11 -into. Requires: sudo apt install xterm [sshpass for auto-login]. Vim/htop/fonts/backspace will be exactly like gnome-terminal.' if checked else 'Emulated uses pyte VT emulator (improved fonts/backspace). Works on any system.'}\n\n"
             f"New terminals will use this mode (restart recommended).")
 
+    def toggle_qterm(self, checked):
+        try:
+            os.environ["POLARTERM_QTERM"] = "1" if checked else "0"
+            cfg = os.path.expanduser("~/.config/polarterm/qterm.conf")
+            os.makedirs(os.path.dirname(cfg), exist_ok=True)
+            with open(cfg, "w") as f:
+                f.write("qterm\n" if checked else "no-qterm\n")
+        except: pass
+        mode = "Real VTE (QTermWidget)" if checked else "Improved pyte+pty"
+        QMessageBox.information(self, "Terminal Mode",
+            f"Switched to {mode}.\n\n"
+            f"{'QTermWidget real VTE: true pty, 256 colors, vim/htop, bracketed-paste. Works on Wayland/X11. Requires: sudo apt install libqtermwidget5-1 python3-pyqt5.qtermwidget (Qt5) or build lxqt/qtermwidget Qt6.' if checked else 'Improved TerminalWidget: pyte HistoryScreen + real pty forkpty for local (job control), paramiko channel for remote. No extra deps.'}\n\n"
+            f"New terminals will use this mode (restart recommended).")
+
     def show_terminal_info(self):
         import shutil
         has_xterm = bool(shutil.which("xterm"))
@@ -1315,7 +1583,19 @@ New in PolarTerm:
         except:
             pyte_v = "not installed"
         native_avail = HAS_NATIVE and is_native_available()
-        cur_mode = "Native xterm embedded" if (self._native_enabled and native_avail) else "Emulated (pyte)" if has_pyte else "Emulated (manual)"
+        qterm_avail = HAS_QTERM and is_qterm_available()
+        has_pty = False
+        try:
+            import pty; has_pty = True
+        except: pass
+        if qterm_avail:
+            cur_mode = "Real VTE (QTermWidget)"
+        elif self._native_enabled and native_avail:
+            cur_mode = "Native xterm embedded"
+        elif has_pyte:
+            cur_mode = "Improved pyte+pty" if has_pty else "Emulated (pyte)"
+        else:
+            cur_mode = "Emulated (manual)"
         font = ""
         try:
             from gui.terminal_widget import _get_terminal_font
@@ -1326,12 +1606,14 @@ New in PolarTerm:
             f"Current mode: <b>{cur_mode}</b><br>"
             f"Font: {font} (zoom Ctrl+/-)<br>"
             f"Native available: {native_avail} (xterm: {has_xterm}, sshpass: {has_sshpass})<br>"
+            f"QTermWidget real VTE: {qterm_avail} (pips: no, apt: libqtermwidget5-1)<br>"
+            f"Real pty (local): {has_pty} (forkpty job control)<br>"
             f"Pyte: {has_pyte} ({pyte_v})<br><br>"
-            f"Toggle via <b>View → Native Terminal</b><br>"
-            f"Native: <code>xterm -into &lt;WID&gt; -e ssh ...</code> - true Linux terminal inside app<br>"
-            f"Emulated: pyte <code>HistoryScreen</code> + <code>QPlainTextEdit</code> - portable<br><br>"
-            f"Fixes: backspace now server-driven (0x7f), fonts fallback chain, "
-            f"CSI parsing, CR/BS, resize pty, wcwidth.")
+            f"Toggle via <b>View → Real VTE (QTermWidget)</b> or <b>Native Terminal</b><br>"
+            f"QTermWidget: real VTE via libqtermwidget - Wayland+X11, vim/htop, 256 colors<br>"
+            f"Native: <code>xterm -into &lt;WID&gt; -e ssh ...</code> - true Linux X11<br>"
+            f"Improved pyte+pty: pyte <code>HistoryScreen</code> + real <code>forkpty</code> for local, <code>paramiko</code> channel for remote - portable, no extra deps<br><br>"
+            f"Fixes: bracketed-paste raw (no 2004 leak), multi-line paste 40ms spacing, backspace 0x7f, resize pty, wcwidth, folder copy recursive.")
 
     def _should_use_native(self, session=None, ssh_wrapper=None):
         """Check if native should be used without re-prompting password.
